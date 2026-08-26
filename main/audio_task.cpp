@@ -47,7 +47,7 @@ static char                 s_current_path[256];
 
 /* ── PCM 输出 ── */
 static bool     s_pending_pcm = false;
-static int16_t  s_pcm_buf[MP3_PCM_BUF_SAMPLES];
+static int16_t *s_pcm_buf = NULL;
 static size_t   s_pcm_bytes   = 0;
 static size_t   s_pcm_offset  = 0;
 
@@ -55,7 +55,7 @@ static size_t   s_pcm_offset  = 0;
 static pcm_pipeline_t *s_pipeline  = NULL;
 static uint32_t        s_pipe_rate = 0;
 static uint8_t         s_pipe_ch   = 0;
-static int16_t         s_out_buf[PCM_OUT_BUF_SAMPLES];
+static int16_t        *s_out_buf = NULL;
 static size_t          s_out_bytes = 0;
 static bool            s_info_done = false;
 
@@ -253,6 +253,18 @@ static void audio_task(void *arg)
                     }
                     s_state = STATE_PAUSED;
                     break;
+                case AUDIO_CMD_SEEK:
+                    if (s_decoder && s_decoder->seek) {
+                        uint32_t fsz = s_decoder->get_file_size(s_decoder);
+                        uint32_t target = (uint64_t)fsz * cmd.param / 1000;
+                        s_decoder->seek(s_decoder, target);
+                        xStreamBufferReset(s_pcm_stream);
+                        s_pending_pcm = false;
+                        s_pcm_offset = 0;
+                        g_song_info.elapsed_sec =
+                            (uint64_t)g_song_info.duration_sec * cmd.param / 1000;
+                    }
+                    break;
                 case AUDIO_CMD_BT_DISCONNECTED:
                     xStreamBufferReset(s_pcm_stream); s_pending_pcm = false;
                     s_state = STATE_PAUSED;
@@ -323,7 +335,7 @@ static void audio_task(void *arg)
 
                 size_t frames = s_pcm_bytes / (ch * 2);
                 s_out_bytes = pcm_pipeline_process(s_pipeline, s_pcm_buf, frames,
-                                                   (uint8_t*)s_out_buf, sizeof(s_out_buf));
+                                                   (uint8_t*)s_out_buf, PCM_OUT_BUF_SAMPLES * sizeof(int16_t));
 
                 s_pending_pcm = true;
                 s_pcm_offset = 0;
@@ -371,6 +383,15 @@ static void audio_task(void *arg)
                 atomic_store_bool(&g_song_info_valid, false);
                 s_state = STATE_IDLE;
                 break;
+            case AUDIO_CMD_SEEK:
+                if (s_decoder && s_decoder->seek) {
+                    uint32_t fsz = s_decoder->get_file_size(s_decoder);
+                    uint32_t target = (uint64_t)fsz * cmd.param / 1000;
+                    s_decoder->seek(s_decoder, target);
+                    g_song_info.elapsed_sec =
+                        (uint64_t)g_song_info.duration_sec * cmd.param / 1000;
+                }
+                break;
             case AUDIO_CMD_PAUSE:
             case AUDIO_CMD_BT_CONNECTED:
             case AUDIO_CMD_BT_DISCONNECTED:
@@ -387,5 +408,19 @@ extern "C" void audio_task_init(const audio_task_params_t *params)
     s_cmd_queue  = params->cmd_queue;
     s_rsp_queue  = params->rsp_queue;
     s_pcm_stream = params->pcm_stream;
+
+    /* 大缓冲优先放 PSRAM, 失败回退内部 RAM (纯 CPU 顺序访问, PSRAM 带宽绰绰有余) */
+    s_pcm_buf = (int16_t *)heap_caps_malloc(MP3_PCM_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!s_pcm_buf) {
+        s_pcm_buf = (int16_t *)heap_caps_malloc(MP3_PCM_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    }
+    s_out_buf = (int16_t *)heap_caps_malloc(PCM_OUT_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!s_out_buf) {
+        s_out_buf = (int16_t *)heap_caps_malloc(PCM_OUT_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    }
+    if (!s_pcm_buf || !s_out_buf) {
+        printf("[音频] FATAL: PCM/OUT 缓冲分配失败\n");
+        return;
+    }
     xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 1, NULL, 0);
 }

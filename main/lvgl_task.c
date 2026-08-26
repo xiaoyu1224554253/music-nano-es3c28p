@@ -32,11 +32,15 @@ extern const lv_font_t chinese_16;
 
 #define TFT_HOR_RES   172
 #define TFT_VER_RES   320
-#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 3)
+#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 10 * 7)
 #define LVGL_BUF_SIZE  (DRAW_BUF_SIZE / 2)
 
 #define TOUCH_Y_MIN  5
 #define TOUCH_Y_MAX  310
+
+/* 忙跑策略: 每周期让出 CPU 喂 WDT + 同核任务运行 */
+#define LVGL_YIELD_PERIOD_US  (1000 * 1000)
+#define LVGL_YIELD_DUR_MS     10
 
 #define COLOR_BG      lv_color_hex(0x050505)
 #define COLOR_CARD    lv_color_hex(0x111111)
@@ -62,7 +66,7 @@ static esp_lcd_panel_handle_t s_panel = NULL;
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_title_label;
 static lv_obj_t *s_artist_label;
-static lv_obj_t *s_progress_bar;
+static lv_obj_t *s_progress_slider;
 static lv_obj_t *s_time_current;
 static lv_obj_t *s_time_total;
 static lv_obj_t *s_fmt_val;
@@ -478,6 +482,22 @@ static void show_file_not_found(void)
     lv_obj_center(btn_lbl);
 }
 
+/* 进度滑块: 松手时发送跳转命令 (拖动中不发) */
+static void progress_slider_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) return;
+    if (!s_progress_slider) return;
+    if (!atomic_load_bool(&g_song_info_valid)) return;
+
+    audio_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = AUDIO_CMD_SEEK;
+    cmd.param = (uint32_t)lv_slider_get_value(s_progress_slider);
+    xQueueSend(s_audio_cmd_queue, &cmd, 0);
+    printf("[LVGL] SEEK: %" PRIu32 "%%\n", cmd.param / 10);
+}
+
 /* ── 歌曲信息轮询: 读 g_song_info 更新标签/进度 ── */
 static void song_info_monitor_cb(lv_timer_t *timer)
 {
@@ -508,7 +528,9 @@ static void song_info_monitor_cb(lv_timer_t *timer)
         if (tot > 0) {
             int val = (int)((uint64_t)cur * 1000 / tot);
             if (val > 1000) val = 1000;
-            lv_bar_set_value(s_progress_bar, val, LV_ANIM_OFF);
+            if (!lv_slider_is_dragged(s_progress_slider)) {
+                lv_slider_set_value(s_progress_slider, val, LV_ANIM_OFF);
+            }
         }
     } else {
         lv_label_set_text(s_title_label, "标题");
@@ -518,7 +540,7 @@ static void song_info_monitor_cb(lv_timer_t *timer)
         lv_label_set_text(s_bd_val, "");
         lv_label_set_text(s_time_current, "0:00");
         lv_label_set_text(s_time_total, "0:00");
-        lv_bar_set_value(s_progress_bar, 0, LV_ANIM_OFF);
+        lv_slider_set_value(s_progress_slider, 0, LV_ANIM_OFF);
     }
 }
 
@@ -722,26 +744,34 @@ static void create_ui(void)
     lv_label_set_long_mode(s_artist_label, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_artist_label, "作者");
 
-    /* ── 播放进度�?── */
-    s_progress_bar = lv_bar_create(scr);
-    lv_obj_set_pos(s_progress_bar, 14, 194);
-    lv_obj_set_size(s_progress_bar, 144, 4);
-    lv_obj_set_style_radius(s_progress_bar, 2, 0);
-    lv_obj_set_style_radius(s_progress_bar, 2, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_progress_bar, COLOR_BORDER, 0);
-    lv_obj_set_style_bg_opa(s_progress_bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(s_progress_bar, COLOR_ACCENT, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(s_progress_bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_border_width(s_progress_bar, 0, 0);
-    lv_obj_set_style_border_width(s_progress_bar, 0, LV_PART_INDICATOR);
-    lv_bar_set_range(s_progress_bar, 0, 1000);
-    lv_bar_set_value(s_progress_bar, 350, LV_ANIM_OFF);
+    /* ── 播放进度滑块 ── */
+    s_progress_slider = lv_slider_create(scr);
+    lv_obj_set_pos(s_progress_slider, 14, 194);
+    lv_obj_set_size(s_progress_slider, 144, 4);
+    lv_obj_set_style_radius(s_progress_slider, 2, 0);
+    lv_obj_set_style_radius(s_progress_slider, 2, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_progress_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(s_progress_slider, COLOR_BORDER, 0);
+    lv_obj_set_style_bg_opa(s_progress_slider, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_progress_slider, COLOR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_progress_slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_progress_slider, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(s_progress_slider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_border_color(s_progress_slider, COLOR_ACCENT, LV_PART_KNOB);
+    lv_obj_set_style_border_width(s_progress_slider, 2, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_progress_slider, 0, LV_PART_KNOB);
+    lv_obj_set_style_transform_width(s_progress_slider, 2, LV_PART_KNOB);
+    lv_obj_set_style_transform_height(s_progress_slider, 2, LV_PART_KNOB);
+    lv_slider_set_range(s_progress_slider, 0, 1000);
+    lv_slider_set_value(s_progress_slider, 0, LV_ANIM_OFF);
+    lv_obj_add_event_cb(s_progress_slider, progress_slider_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(s_progress_slider, progress_slider_cb, LV_EVENT_PRESS_LOST, NULL);
 
     s_time_current = lv_label_create(scr);
     lv_obj_set_pos(s_time_current, 14, 204);
     lv_obj_set_style_text_font(s_time_current, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_time_current, COLOR_ACCENT, 0);
-    lv_label_set_text(s_time_current, "1:24");
+    lv_label_set_text(s_time_current, "0:00");
 
     s_time_total = lv_label_create(scr);
     lv_obj_set_pos(s_time_total, 110, 204);
@@ -749,7 +779,7 @@ static void create_ui(void)
     lv_obj_set_style_text_align(s_time_total, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_style_text_font(s_time_total, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_time_total, COLOR_MUTED, 0);
-    lv_label_set_text(s_time_total, "4:02");
+    lv_label_set_text(s_time_total, "0:00");
 
     /* ── 播放控制按钮�?── */
     /* 播放 / 暂停 */
@@ -907,7 +937,7 @@ static void lvgl_task(void *arg)
     bt_cmd_t    bt_cmd;
 
     while (1) {
-        uint32_t lv_delay = lv_timer_handler();
+        lv_timer_handler();
 
         QueueHandle_t active = xQueueSelectFromSet(s_queue_set, 0);
 
@@ -1051,9 +1081,12 @@ static void lvgl_task(void *arg)
             }
         }
 
-        if (lv_delay > 20) lv_delay = 20;
-        if (lv_delay < 10) lv_delay = 10;
-        vTaskDelay(pdMS_TO_TICKS(lv_delay));
+        /* 忙跑策略: 不依赖 lv_timer 返回值 sleep, 每 1 秒让出 10ms
+         * 喂 Task WDT + 让同核 (sys_serial/sys_monitor/idle) 任务运行 */
+        //if (esp_timer_get_time() - s_last_yield_us >= LVGL_YIELD_PERIOD_US) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            //s_last_yield_us = esp_timer_get_time();
+        //}
     }
 }
 

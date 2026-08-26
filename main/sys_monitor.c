@@ -25,7 +25,7 @@
 #define TAG_ADC     "SYS_MON"
 
 #define MOUNT_POINT  "/sdcard"
-#define PIN_SD_DETECT 37
+#define PIN_SD_DETECT 13
 #define PIN_VOL_UP    36
 #define PIN_VOL_DOWN  38
 #define VOLUME_STEP   8

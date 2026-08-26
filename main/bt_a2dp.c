@@ -255,6 +255,14 @@ static uint64_t s_cb_total_bytes   = 0;
 static uint64_t s_cb_total_got     = 0;
 static int64_t  s_cb_last_print_us = 0;
 
+/* 欠载诊断: pcm_stream 不够取时记录 (已禁用, 调试用) */
+#if 0
+extern volatile bool g_anim_active;
+static int64_t  s_cb_last_underrun_us = 0;
+static uint32_t s_cb_underrun_count   = 0;
+static uint32_t s_cb_underrun_empty   = 0;
+#endif
+
 static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
 {
     if (!data || len <= 0) {
@@ -271,6 +279,15 @@ static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
     size_t got = xStreamBufferReceive(s_iface.pcm_stream, data, (size_t)len, 0);
     if (got < (size_t)len) {
         memset(data + got, 0, (size_t)len - got);
+#if 0
+        s_cb_underrun_count++;
+        int64_t now = esp_timer_get_time();
+        if ((now - s_cb_last_underrun_us) >= 50000LL) {
+            s_cb_last_underrun_us = now;
+            size_t avail = xStreamBufferBytesAvailable(s_iface.pcm_stream);
+            if (avail == 0) s_cb_underrun_empty++;
+        }
+#endif
     }
 
     s_cb_total_bytes += (uint64_t)len;
@@ -279,9 +296,7 @@ static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
     int64_t now = esp_timer_get_time();
     if ((now - s_cb_last_print_us) >= 5000000LL) {
         s_cb_last_print_us = now;
-        uint32_t rate = (uint32_t)(s_cb_total_got * 1000000LL / (uint64_t)(now > 0 ? now : 1));
-        printf("[BT_CB] 调用%5" PRIu32 "次 | len=%6" PRId32 " | 累计请求=%6" PRIu64 " | 累计读取=%6" PRIu64 " | 速率=%" PRIu32 " B/s\n",
-               s_cb_call_count, len, s_cb_total_bytes, s_cb_total_got, rate);
+        /* [SPI 测量期间] BT_CB 汇总打印已禁用 */
     }
 
     return len;
@@ -586,7 +601,7 @@ static void bt_a2dp_task(void *arg)
 
     s_iface.cmd_queue  = xQueueCreate(10, sizeof(bt_cmd_t));
     s_iface.evt_queue  = xQueueCreate(20, sizeof(bt_evt_t));
-    s_iface.pcm_stream = xStreamBufferCreate(8 * 1024, 512);
+    s_iface.pcm_stream = xStreamBufferCreate(16 * 1024, 512);
 
     s_dispatch_queue = xQueueCreate(10, sizeof(bt_dispatch_msg_t));
     s_queue_set      = xQueueCreateSet(8);

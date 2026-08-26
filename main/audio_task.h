@@ -18,11 +18,13 @@ typedef enum {
     AUDIO_CMD_PAUSE           = 2,
     AUDIO_CMD_BT_CONNECTED    = 3,
     AUDIO_CMD_BT_DISCONNECTED = 4,
+    AUDIO_CMD_SEEK            = 5,
 } audio_cmd_type_t;
 
 typedef struct {
     audio_cmd_type_t type;
     char             path[256];
+    uint32_t         param;
 } audio_cmd_t;
 
 typedef enum {

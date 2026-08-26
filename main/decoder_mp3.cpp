@@ -260,6 +260,21 @@ static uint32_t mp3_get_position(audio_decoder_t *iface)
     return pos > 0 ? (uint32_t)pos : 0;
 }
 
+static bool mp3_seek(audio_decoder_t *iface, uint32_t byte_offset)
+{
+    decoder_mp3_t *d = (decoder_mp3_t *)iface;
+    if(!d->file || !d->mp3) return false;
+    if(byte_offset > d->file_size) byte_offset = d->file_size;
+    if(fseek(d->file, (long)byte_offset, SEEK_SET) != 0) return false;
+    d->mp3->reset();
+    d->in_off = 0;
+    d->in_len = 0;
+    d->eof    = false;
+    d->info_done = false;
+    printf("[音频] SEEK -> %" PRIu32 " bytes\n", byte_offset);
+    return true;
+}
+
 static const char *mp3_get_title(audio_decoder_t *iface)
 {
     return ((decoder_mp3_t *)iface)->title;
@@ -302,6 +317,7 @@ audio_decoder_t *decoder_mp3_create(void)
     d->iface.get_bitrate     = mp3_get_bitrate;
     d->iface.get_file_size   = mp3_get_file_size;
     d->iface.get_position    = mp3_get_position;
+    d->iface.seek            = mp3_seek;
     d->iface.get_title       = mp3_get_title;
     d->iface.get_artist      = mp3_get_artist;
     d->iface.get_cover_data  = mp3_get_cover_data;
