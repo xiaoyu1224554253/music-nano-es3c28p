@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include "sys_monitor.h"
 #include "ui_list.h"
+#include "lvgl_task.h"
 #include "File.h"
 
 extern const lv_font_t chinese_16;
@@ -25,15 +26,24 @@ static int   s_fs_page            = 0;
 static int   s_fs_total           = 0;
 static bool  s_fs_inside          = false;
 static const char *s_fs_group    = NULL;
+static lv_obj_t *s_fs_current_btn = NULL; /* 当前播放歌曲对应的列表行按钮 */
 
 static lv_img_dsc_t s_fs_icon_dir;
 static lv_img_dsc_t s_fs_icon_music;
+
+static void (*s_play_cb)(const char *group, const char *name) = NULL;
+
+void fs_list_set_play_cb(void (*cb)(const char *group, const char *name))
+{
+    s_play_cb = cb;
+}
 
 static void fs_browser_open(void);
 static void fs_browser_close(void);
 static void fs_browser_show_page(int page);
 static void fs_browser_enter_dir(const char *cache_name);
 static void fs_browser_go_back(void);
+static void fs_browser_jump_to_current(void);
 
 static int fs_cache_count_for_group(const char *group)
 {
@@ -66,7 +76,35 @@ static void fs_item_click_cb(lv_event_t *e)
 
     if (entry->is_dir) {
         fs_browser_enter_dir(entry->name);
+    } else if (s_play_cb) {
+        /* 播放切换后由 fs_browser_refresh() 统一重绘, 让绿色高亮跟随新播放的歌曲 */
+        s_play_cb(s_fs_group, entry->name);
     }
+}
+
+/* 该列表项是否对应主界面当前正在播放的歌曲 */
+static bool fs_entry_is_current(fs_entry_t *entry)
+{
+    const char *group = player_current_group();
+    const char *name  = player_current_name();
+    if (!group || !name || !entry) return false;
+
+    /* 文件条目: 组与文件名都匹配 */
+    if (!entry->is_dir && s_fs_group
+        && strcmp(s_fs_group, group) == 0
+        && strcmp(entry->name, name) == 0) {
+        return true;
+    }
+
+    /* 根目录下: 高亮包含当前播放歌曲的文件夹 */
+    if (entry->is_dir && s_fs_group
+        && strcmp(s_fs_group, "sdcard") == 0
+        && strncmp(group, "sdcard_", 7) == 0
+        && strcmp(entry->name, group + 7) == 0) {
+        return true;
+    }
+
+    return false;
 }
 
 static void fs_add_item(fs_entry_t *entry)
@@ -86,11 +124,19 @@ static void fs_add_item(fs_entry_t *entry)
 
     lv_obj_set_user_data(btn, entry);
     lv_obj_add_event_cb(btn, fs_item_click_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 高亮当前正在播放的歌曲行 */
+    if (fs_entry_is_current(entry)) {
+        s_fs_current_btn = btn;
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xB7F7C2), 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    }
 }
 
 static void fs_browser_show_page(int page)
 {
     s_fs_page = page;
+    s_fs_current_btn = NULL;
 
     int total = fs_cache_count_for_group(s_fs_group);
     s_fs_total = (total + FS_ITEMS - 1) / FS_ITEMS;
@@ -161,6 +207,7 @@ static void fs_browser_close(void)
     s_fs_next_btn  = NULL;
     s_fs_group     = NULL;
     s_fs_inside    = false;
+    s_fs_current_btn = NULL;
 }
 
 static void fs_overlay_click_cb(lv_event_t *e)
@@ -231,8 +278,8 @@ static void fs_browser_open(void)
     lv_obj_clear_flag(s_fs_cont, LV_OBJ_FLAG_SCROLLABLE);
 
     s_fs_title = lv_label_create(s_fs_cont);
-    lv_obj_set_pos(s_fs_title, 4, 1);
-    lv_obj_set_size(s_fs_title, FS_W - 40, 18);
+    lv_obj_set_pos(s_fs_title, 4, 0);
+    lv_obj_set_size(s_fs_title, FS_W - 40, 22);
     lv_obj_set_style_text_font(s_fs_title, &chinese_16, 0);
     lv_obj_set_style_text_color(s_fs_title, lv_color_black(), 0);
     lv_label_set_long_mode(s_fs_title, LV_LABEL_LONG_DOT);
@@ -254,10 +301,10 @@ static void fs_browser_open(void)
     lv_obj_center(back_lbl);
 
     s_fs_list = lv_list_create(s_fs_cont);
-    lv_obj_set_pos(s_fs_list, 0, 18);
+    lv_obj_set_pos(s_fs_list, 0, 22);
     /* 修改列表高度：原为 FS_H - 36，现减少高度以为大按钮腾出空间 */
-    /* 假设底部导航区高度设为 40 (原18)，则列表高度 = FS_H(220) - 18(标题) - 40(底部) = 162 */
-    lv_obj_set_size(s_fs_list, FS_W, FS_H - 54); 
+    /* 假设底部导航区高度设为 40 (原18)，则列表高度 = FS_H(220) - 22(标题) - 40(底部) = 158 */
+    lv_obj_set_size(s_fs_list, FS_W, FS_H - 58); 
     lv_obj_set_style_bg_color(s_fs_list, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(s_fs_list, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_fs_list, 0, 0);
@@ -315,12 +362,96 @@ static void fs_browser_open(void)
 
     s_fs_group = "sdcard";
     fs_browser_show_page(0);
+
+    /* 打开后自动定位到主界面当前播放的歌曲 */
+    fs_browser_jump_to_current();
+}
+
+/* 定位到当前播放歌曲: 进入所在目录、跳到所在页并高亮该文件 */
+static void fs_browser_jump_to_current(void)
+{
+    if (!s_fs_overlay) return;
+
+    const char *group = player_current_group();
+    const char *name  = player_current_name();
+    if (!group || !name || !g_fs_cache) return;
+
+    /* 切换到当前播放歌曲所在的组 (目录) */
+    if (strncmp(group, "sdcard_", 7) == 0) {
+        s_fs_inside = true;
+        lv_label_set_text(s_fs_title, group + 7);
+    } else {
+        s_fs_inside = false;
+        lv_label_set_text(s_fs_title, "Music Files");
+    }
+    s_fs_group = group;
+
+    /* 在组内 (含目录项, 与列表显示顺序一致) 找到该文件的位置 */
+    int pos = -1;
+    int seen = 0;
+    for (int i = 0; i < g_fs_cache->count; i++) {
+        fs_entry_t *e = &g_fs_cache->entries[i];
+        if (strcmp(e->group, group) == 0) {
+            if (strcmp(e->name, name) == 0) {
+                pos = seen;
+                break;
+            }
+            seen++;
+        }
+    }
+
+    if (pos < 0) {
+        fs_browser_show_page(0);
+        return;
+    }
+
+    int page = pos / FS_ITEMS;
+    fs_browser_show_page(page);
+
+    /* 滚动到可见区域, 让高亮的当前歌曲行显示出来 */
+    if (s_fs_current_btn) {
+        lv_obj_scroll_to_view(s_fs_current_btn, LV_ANIM_OFF);
+        s_fs_current_btn = NULL;
+    }
+}
+
+/* 两向同步: 播放歌曲变化时刷新绿色高亮。
+ * 仅当浏览器打开且当前歌曲在当前视图内 (本组 / 根目录高亮文件夹) 时重绘, 保留滚动位置。 */
+void fs_browser_refresh(void)
+{
+    if (!s_fs_overlay || !g_fs_cache || !s_fs_group) return;
+
+    const char *group = player_current_group();
+    const char *name  = player_current_name();
+    if (!group || !name) return;
+
+    bool in_view = (strcmp(s_fs_group, group) == 0)
+                   || (strcmp(s_fs_group, "sdcard") == 0
+                       && strncmp(group, "sdcard_", 7) == 0);
+    if (!in_view) return;
+
+    lv_coord_t scroll_y = lv_obj_get_scroll_y(s_fs_list);
+    fs_browser_show_page(s_fs_page);
+    lv_obj_scroll_to_y(s_fs_list, scroll_y, LV_ANIM_OFF);
+}
+
+/* 导航到当前播放歌曲所在目录并高亮 (SD 恢复 / 打开浏览器时使用) */
+void fs_browser_jump(void)
+{
+    if (!s_fs_overlay) return;
+    fs_browser_jump_to_current();
 }
 
 
 void fs_menu_click_cb(lv_event_t *e)
 {
-    fs_browser_open();
+    if (s_fs_overlay) {
+        /* 已打开时再点一次: 关闭浏览器 */
+        fs_browser_close();
+    } else {
+        /* 未打开: 打开浏览器 (打开时自动定位到当前播放歌曲) */
+        fs_browser_open();
+    }
 }
 
 void fs_browser_on_sd_ready(void)
@@ -386,24 +517,25 @@ static void bt_send_cmd(bt_cmd_type_t type, const char *name)
     xQueueSend(s_bt_iface->cmd_queue, &cmd, 0);
 }
 
+static void bt_apply_state(bt_state_t state, const char *name);
+static void bt_maybe_start_scan(void);
+
+/* 仅在「列表打开 + 未连接 + 未在扫描」时发一次扫描 */
+static void bt_maybe_start_scan(void)
+{
+    if (!s_bt_open || s_bt_state != BT_STATE_DISCONNECTED || s_bt_scanning) return;
+    s_bt_scanning = true;
+    bt_send_cmd(BT_CMD_SCAN, NULL);
+}
+
 static void bt_item_click_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
     const char *name = (const char *)lv_obj_get_user_data(btn);
     if (!name) return;
 
-    strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
-    s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
-    s_bt_state = BT_STATE_CONNECTING;
-
-    lv_label_set_text(s_bt_card_name, s_bt_connect_name);
-    lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_BLUE, 0);
-    lv_label_set_text(s_bt_action_lbl, "Connecting");
-
-    lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
-
+    s_bt_scanning = false;
+    bt_apply_state(BT_STATE_CONNECTING, name);
     bt_send_cmd(BT_CMD_CONNECT, name);
 }
 
@@ -419,6 +551,45 @@ static void bt_show_list_view(void)
     lv_obj_clear_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* 依据给定状态更新影子状态 + (列表打开时)渲染对应视图 */
+static void bt_apply_state(bt_state_t state, const char *name)
+{
+    s_bt_state = state;
+    if (name && name[0]) {
+        strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
+        s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
+    }
+
+    if (!s_bt_open) return;
+
+    s_bt_scanning = false;
+
+    switch (state) {
+    case BT_STATE_DISCONNECTED:
+        bt_show_list_view();
+        bt_maybe_start_scan();
+        break;
+    case BT_STATE_CONNECTING:
+        lv_label_set_text(s_bt_card_name, s_bt_connect_name);
+        lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_BLUE, 0);
+        lv_label_set_text(s_bt_action_lbl, "Connecting");
+        lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case BT_STATE_CONNECTED:
+        lv_label_set_text(s_bt_card_name, s_bt_connect_name);
+        lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_RED, 0);
+        lv_label_set_text(s_bt_action_lbl, "Disconnect");
+        lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
+        break;
+    default:
+        break;
+    }
 }
 
 static void bt_refresh_list(void)
@@ -461,8 +632,6 @@ static void bt_list_open(void)
     if (s_bt_open) return;
 
     s_bt_open = true;
-    s_bt_state = BT_STATE_DISCONNECTED;
-    memset(s_bt_connect_name, 0, sizeof(s_bt_connect_name));
     s_bt_pending_count = 0;
     s_bt_display_count = 0;
 
@@ -539,6 +708,7 @@ static void bt_list_open(void)
     lv_obj_add_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
 
+    bt_apply_state(s_bt_state, NULL);
     bt_send_cmd(BT_CMD_GET_STATE, NULL);
 }
 
@@ -603,94 +773,26 @@ void bt_list_on_scan_done(void)
 
     bt_refresh_list();
 
-    if (s_bt_open && s_bt_state == BT_STATE_DISCONNECTED) {
-        s_bt_scanning = true;
-        bt_send_cmd(BT_CMD_SCAN, NULL);
-    }
+    bt_maybe_start_scan();
 }
 
 void bt_list_on_connected(const char *name)
 {
-    if (name && name[0]) {
-        strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
-        s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
-    }
-    s_bt_state = BT_STATE_CONNECTED;
-    s_bt_scanning = false;
-
-    if (s_bt_open) {
-        lv_label_set_text(s_bt_card_name, s_bt_connect_name);
-        lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_RED, 0);
-        lv_label_set_text(s_bt_action_lbl, "Disconnect");
-
-        lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
-    }
+    bt_apply_state(BT_STATE_CONNECTED, name);
 }
 
 void bt_list_on_connect_failed(const char *name)
 {
-    s_bt_state = BT_STATE_DISCONNECTED;
-    s_bt_scanning = false;
-
-    if (s_bt_open) {
-        bt_show_list_view();
-        s_bt_scanning = true;
-        bt_send_cmd(BT_CMD_SCAN, NULL);
-    }
+    bt_apply_state(BT_STATE_DISCONNECTED, NULL);
 }
 
 void bt_list_on_disconnected(void)
 {
-    s_bt_state = BT_STATE_DISCONNECTED;
-    s_bt_scanning = false;
     memset(s_bt_connect_name, 0, sizeof(s_bt_connect_name));
-
-    if (s_bt_open) {
-        bt_show_list_view();
-        s_bt_scanning = true;
-        bt_send_cmd(BT_CMD_SCAN, NULL);
-    }
+    bt_apply_state(BT_STATE_DISCONNECTED, NULL);
 }
 
 void bt_list_on_state_rsp(bt_state_t state, const char *name)
 {
-    if (!s_bt_open) return;
-
-    s_bt_state = state;
-
-    switch (state) {
-    case BT_STATE_DISCONNECTED:
-        bt_show_list_view();
-        s_bt_scanning = true;
-        bt_send_cmd(BT_CMD_SCAN, NULL);
-        break;
-    case BT_STATE_CONNECTING:
-        if (name && name[0]) {
-            strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
-            s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
-        }
-        lv_label_set_text(s_bt_card_name, s_bt_connect_name);
-        lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_BLUE, 0);
-        lv_label_set_text(s_bt_action_lbl, "Connecting");
-        lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
-        break;
-    case BT_STATE_CONNECTED:
-        if (name && name[0]) {
-            strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
-            s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
-        }
-        lv_label_set_text(s_bt_card_name, s_bt_connect_name);
-        lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_RED, 0);
-        lv_label_set_text(s_bt_action_lbl, "Disconnect");
-        lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
-        break;
-    default:
-        break;
-    }
+    bt_apply_state(state, name);
 }

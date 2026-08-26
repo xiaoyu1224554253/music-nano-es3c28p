@@ -22,11 +22,13 @@ typedef enum {
 
 typedef struct {
     audio_cmd_type_t type;
-    char             path[64];
+    char             path[256];
 } audio_cmd_t;
 
 typedef enum {
-    AUDIO_RSP_BT_CHECK = 0,
+    AUDIO_RSP_BT_CHECK       = 0,
+    AUDIO_RSP_FILE_NOT_FOUND = 1,
+    AUDIO_RSP_SONG_FINISHED  = 2,
 } audio_rsp_type_t;
 
 typedef struct {

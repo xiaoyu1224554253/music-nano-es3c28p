@@ -16,6 +16,7 @@
 #include "bt_a2dp.h"
 #include "audio_task.h"
 #include "atomic_utils.h"
+#include "volume.h"
 
 #define BT_TAG              "BT_A2DP"
 #define RC_TAG              "BT_RC"
@@ -43,7 +44,6 @@ static bool s_bt_ready = false;
 static bool s_connected = false;
 static bool s_scanning = false;
 static bool s_connecting = false;
-static bool s_sleeping = false;
 static bool s_stream_started = false;
 static esp_bd_addr_t s_peer_bda;
 
@@ -61,6 +61,8 @@ static char        s_connecting_name[32];
 static char        s_connected_name[32];
 
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;
+
+static int32_t s_last_sent_vol = -1; /* 已同步到耳机的音量, -1 表示未同步 */
 
 static QueueHandle_t    s_dispatch_queue = NULL;
 static QueueSetHandle_t s_queue_set      = NULL;
@@ -131,6 +133,24 @@ static void send_evt(bt_evt_type_t type, const char *name, int error)
     xQueueSend(s_iface.evt_queue, &evt, 0);
 }
 
+/* 回发当前状态给列表, 用于查询应答与被拒命令的校正 */
+static void send_state_rsp(void)
+{
+    bt_evt_t evt;
+    memset(&evt, 0, sizeof(evt));
+    evt.type = BT_EVT_STATE_RSP;
+    if (s_connected) {
+        evt.state = BT_STATE_CONNECTED;
+        strncpy(evt.device_name, s_connected_name, sizeof(evt.device_name) - 1);
+    } else if (s_connecting) {
+        evt.state = BT_STATE_CONNECTING;
+        strncpy(evt.device_name, s_connecting_name, sizeof(evt.device_name) - 1);
+    } else {
+        evt.state = BT_STATE_DISCONNECTED;
+    }
+    xQueueSend(s_iface.evt_queue, &evt, 0);
+}
+
 static bool bt_a2dp_send_dispatch(bt_dispatch_type_t type, uint16_t event, void *param, size_t param_len)
 {
     bt_dispatch_msg_t msg;
@@ -161,8 +181,9 @@ static void bt_a2dp_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *ev
     switch (event_id) {
     case ESP_AVRC_RN_VOLUME_CHANGE: {
         ESP_LOGI(RC_TAG, "音量已变化: %d", event_parameter->volume);
-        esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_RN_VOLUME_CHANGE,
-                                                  event_parameter->volume + 5);
+        /* 耳机端音量已生效, 同步全局并标记已同步, 避免 5Hz 轮询回环 */
+        volume_set(event_parameter->volume);
+        s_last_sent_vol = event_parameter->volume;
         bt_a2dp_volume_changed();
         break;
     }
@@ -183,8 +204,13 @@ static void bt_a2dp_hdl_avrc_evt(uint16_t event, void *p_param)
                  rc->conn_stat.connected, bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
         if (rc->conn_stat.connected) {
             esp_avrc_ct_send_get_rn_capabilities_cmd(APP_RC_CT_TL_GET_CAPS);
+            /* 连接后第一时间同步当前音量到耳机 */
+            int32_t v = volume_get();
+            s_last_sent_vol = v;
+            esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_GET_CAPS, (uint8_t)v);
         } else {
             s_avrc_peer_rn_cap.bits = 0;
+            s_last_sent_vol = -1;
         }
         break;
     }
@@ -213,6 +239,9 @@ static void bt_a2dp_hdl_avrc_evt(uint16_t event, void *p_param)
     }
     case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT: {
         ESP_LOGI(RC_TAG, "设置绝对音量响应: %d", rc->set_volume_rsp.volume);
+        /* 耳机确认后的实际音量(可能被钳位) */
+        volume_set(rc->set_volume_rsp.volume);
+        s_last_sent_vol = rc->set_volume_rsp.volume;
         break;
     }
     default:
@@ -377,7 +406,7 @@ static void bt_a2dp_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p
                     s_scanning = true;
                     esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,
                                                1, 0);
-                } else if (s_connect_retry < 2) {
+                } else if (s_connect_retry < 4) {
                     s_connect_retry++;
                     ESP_LOGI(BT_TAG, "未找到设备 %s，第 %d 次重试",
                              s_connect_target, s_connect_retry);
@@ -474,6 +503,42 @@ static void bt_a2dp_hdl_stack_up(void)
     ESP_LOGI(BT_TAG, "蓝牙初始化完成");
 }
 
+/* ── 未连接时排水: 以 44.1kHz/16bit/双声道 真实速率丢弃 PCM ── */
+#define DRAIN_BYTES_PER_SEC  (44100 * 2 * 2)
+
+/* 5Hz 轮询: 全局音量有变化则同步到耳机 */
+static void bt_sync_volume(void)
+{
+    int32_t v = volume_get();
+    if (v != s_last_sent_vol) {
+        s_last_sent_vol = v;
+        esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_GET_CAPS, (uint8_t)v);
+    }
+}
+
+static void bt_drain_pcm(void)
+{
+    static int64_t s_drain_last_us = 0;
+    int64_t now = esp_timer_get_time();
+    if (s_drain_last_us == 0) {
+        s_drain_last_us = now;
+        return;
+    }
+    int64_t dt = now - s_drain_last_us;
+    s_drain_last_us = now;
+    if (dt <= 0) return;
+
+    uint32_t budget = (uint32_t)(((uint64_t)DRAIN_BYTES_PER_SEC * (uint64_t)dt) / 1000000ULL);
+
+    uint8_t tmp[256];
+    while (budget > 0) {
+        size_t want = budget > sizeof(tmp) ? sizeof(tmp) : budget;
+        size_t got = xStreamBufferReceive(s_iface.pcm_stream, tmp, want, 0);
+        if (got == 0) break;
+        budget -= got;
+    }
+}
+
 /* ── BT task entry (merged: commands + dispatch events) ── */
 static void bt_a2dp_task(void *arg)
 {
@@ -537,14 +602,9 @@ static void bt_a2dp_task(void *arg)
     QueueHandle_t     active;
 
     while (1) {
-        bool busy = s_scanning || s_connecting || s_connected;
-
         if (s_connected) {
-            if (s_sleeping) {
-                esp_bt_sleep_disable();
-                s_sleeping = false;
-            }
             active = xQueueSelectFromSet(s_queue_set, pdMS_TO_TICKS(200));
+            bt_sync_volume();
             if (active == NULL) {
                 bool want = atomic_load_bool(&g_pcm_active);
                 if (want != s_stream_started) {
@@ -554,24 +614,18 @@ static void bt_a2dp_task(void *arg)
                 }
                 continue;
             }
-        } else if (busy) {
-            if (s_sleeping) {
-                esp_bt_sleep_disable();
-                s_sleeping = false;
-            }
-            active = xQueueSelectFromSet(s_queue_set, portMAX_DELAY);
         } else {
-            if (s_sleeping) {
-                esp_bt_sleep_disable();
-                s_sleeping = false;
-            }
-            active = xQueueSelectFromSet(s_queue_set, pdMS_TO_TICKS(1000));
+            /* 未连接(含连接中): 仅排水(纯 CPU)。调制解调器睡眠由控制器自动管理, 不手动开关 */
+            bool have_pcm = atomic_load_bool(&g_pcm_active) ||
+                            xStreamBufferBytesAvailable(s_iface.pcm_stream) > 0;
+            active = xQueueSelectFromSet(s_queue_set,
+                                         have_pcm ? pdMS_TO_TICKS(100)
+                                                  : pdMS_TO_TICKS(1000));
             if (active == NULL) {
-                esp_bt_sleep_enable();
-                s_sleeping = true;
-                active = xQueueSelectFromSet(s_queue_set, portMAX_DELAY);
-                esp_bt_sleep_disable();
-                s_sleeping = false;
+                if (have_pcm) {
+                    bt_drain_pcm();
+                }
+                continue;
             }
         }
 
@@ -582,6 +636,7 @@ static void bt_a2dp_task(void *arg)
             case BT_CMD_SCAN: {
                 if (s_connected) {
                     ESP_LOGW(BT_TAG, "已连接设备，忽略扫描命令");
+                    send_state_rsp();
                     break;
                 }
                 if (s_scanning) {
@@ -603,6 +658,7 @@ static void bt_a2dp_task(void *arg)
             case BT_CMD_STOP_SCAN: {
                 if (!s_scanning) {
                     ESP_LOGW(BT_TAG, "未在扫描中，忽略终止扫描命令");
+                    send_state_rsp();
                     break;
                 }
                 ESP_LOGI(BT_TAG, "终止扫描...");
@@ -655,21 +711,7 @@ static void bt_a2dp_task(void *arg)
                 break;
             }
             case BT_CMD_GET_STATE: {
-                bt_evt_t evt;
-                memset(&evt, 0, sizeof(evt));
-                evt.type = BT_EVT_STATE_RSP;
-                if (s_connected) {
-                    evt.state = BT_STATE_CONNECTED;
-                    strncpy(evt.device_name, s_connected_name,
-                            sizeof(evt.device_name) - 1);
-                } else if (s_connecting) {
-                    evt.state = BT_STATE_CONNECTING;
-                    strncpy(evt.device_name, s_connecting_name,
-                            sizeof(evt.device_name) - 1);
-                } else {
-                    evt.state = BT_STATE_DISCONNECTED;
-                }
-                xQueueSend(s_iface.evt_queue, &evt, 0);
+                send_state_rsp();
                 break;
             }
             default:

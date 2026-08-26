@@ -36,10 +36,14 @@ extern volatile bool   g_sd_ready;
 extern volatile float  g_vbat;
 extern volatile float  g_cpu_temp;
 extern fs_cache_t     *g_fs_cache;
-extern volatile bool   g_sd_remove_ack;
 
 void fs_build_real_path(const char *group, const char *name,
                         char *out, size_t out_size);
+
+/* 在缓存 g_fs_cache 中按真实路径查找文件, 找到则输出其 group/name */
+bool fs_cache_find_by_path(const char *path,
+                           char *group_out, size_t group_size,
+                           char *name_out, size_t name_size);
 
 #ifdef __cplusplus
 }

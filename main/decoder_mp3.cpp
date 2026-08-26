@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "micro_mp3/mp3_decoder.h"
 #include "decoder.h"
+#include "song_info.h"
 
 #define MP3_TAG "DEC_MP3"
 #define MP3_INPUT_CHUNK_SIZE 2048
@@ -15,6 +16,8 @@
 #define ID3_FRAME_ARTIST  "TPE1"
 #define ID3_FRAME_ALBUM   "TALB"
 #define ID3_FRAME_COVER   "APIC"
+
+#define COVER_MAX_SIZE    (512 * 1024)
 
 typedef struct {
     audio_decoder_t iface;
@@ -30,6 +33,13 @@ typedef struct {
 
     uint32_t sample_rate;
     uint8_t  channels;
+
+    char     title[SONG_TITLE_MAX];
+    char     artist[SONG_ARTIST_MAX];
+    uint32_t file_size;
+
+    uint8_t *cover_data;   /* APIC 图片字节 (PSRAM), 未移交时由 mp3_close 释放 */
+    size_t   cover_size;
 } decoder_mp3_t;
 
 static uint32_t syncsafe(const uint8_t *p)
@@ -44,7 +54,10 @@ static uint32_t be32(const uint8_t *p)
          | ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
 }
 
-static void parse_id3v2(FILE *f, long *off)
+static void parse_id3v2(FILE *f, long *off,
+                        char *title_out, size_t title_size,
+                        char *artist_out, size_t artist_size,
+                        uint8_t **cover_out, size_t *cover_size_out)
 {
     *off = 0;
     uint8_t h[10];
@@ -59,8 +72,16 @@ static void parse_id3v2(FILE *f, long *off)
         if(fs>ts-pos)break;
         uint8_t *d=(uint8_t*)malloc(fs);
         if(!d||fread(d,1,fs,f)!=fs){free(d);break;} pos+=fs;
-        if(!memcmp(fh,ID3_FRAME_TITLE,4)&&fs>1)  printf("[ID3] 标题: %.*s\n",(int)(fs-1),d+1);
-        if(!memcmp(fh,ID3_FRAME_ARTIST,4)&&fs>1) printf("[ID3] 艺术家: %.*s\n",(int)(fs-1),d+1);
+        if(!memcmp(fh,ID3_FRAME_TITLE,4)&&fs>1){
+            size_t n=(size_t)(fs-1); if(n>=title_size)n=title_size-1;
+            if(title_out){memcpy(title_out,d+1,n);title_out[n]='\0';}
+            printf("[ID3] 标题: %.*s\n",(int)(fs-1),d+1);
+        }
+        if(!memcmp(fh,ID3_FRAME_ARTIST,4)&&fs>1){
+            size_t n=(size_t)(fs-1); if(n>=artist_size)n=artist_size-1;
+            if(artist_out){memcpy(artist_out,d+1,n);artist_out[n]='\0';}
+            printf("[ID3] 艺术家: %.*s\n",(int)(fs-1),d+1);
+        }
         if(!memcmp(fh,ID3_FRAME_ALBUM,4)&&fs>1)  printf("[ID3] 专辑: %.*s\n",(int)(fs-1),d+1);
         if(!memcmp(fh,ID3_FRAME_COVER,4)&&fs>4){
             const char*m=(const char*)(d+1); size_t ml=strlen(m);
@@ -70,6 +91,15 @@ static void parse_id3v2(FILE *f, long *off)
             size_t isz=d+fs-p;
             printf("[ID3] 封面: MIME=%s, 类型=%s, 大小=%zu bytes\n", m,
                    pt==3?"封面(正面)":pt==4?"封面(背面)":"其他", isz);
+            if (cover_out && *cover_out == NULL && isz > 0 && isz <= COVER_MAX_SIZE) {
+                uint8_t *buf = (uint8_t*)heap_caps_malloc(isz, MALLOC_CAP_SPIRAM);
+                if (buf) {
+                    memcpy(buf, p, isz);
+                    *cover_out = buf;
+                    if (cover_size_out) *cover_size_out = isz;
+                    printf("[ID3] 封面字节已提取到 PSRAM: %zu bytes\n", isz);
+                }
+            }
         }
         free(d);
     }
@@ -80,17 +110,26 @@ static bool mp3_open(audio_decoder_t *iface, const char *path)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
 
+    /* 释放上次残留封面 (防止重复 open 泄漏) */
+    if (d->cover_data) {
+        heap_caps_free(d->cover_data);
+        d->cover_data = NULL;
+        d->cover_size = 0;
+    }
+
     FILE *f = fopen(path, "rb");
     if(!f) return false;
 
     long off = 0;
-    parse_id3v2(f, &off);
+    parse_id3v2(f, &off, d->title, sizeof(d->title), d->artist, sizeof(d->artist),
+                &d->cover_data, &d->cover_size);
 
     d->mp3 = new micro_mp3::Mp3Decoder();
     d->inbuf = (uint8_t *)heap_caps_malloc(MP3_INPUT_CHUNK_SIZE, MALLOC_CAP_DEFAULT);
     if(!d->mp3 || !d->inbuf){
         if(d->mp3){delete d->mp3; d->mp3=NULL;}
         if(d->inbuf){heap_caps_free(d->inbuf); d->inbuf=NULL;}
+        if(d->cover_data){heap_caps_free(d->cover_data); d->cover_data=NULL; d->cover_size=0;}
         fclose(f);
         return false;
     }
@@ -101,10 +140,12 @@ static bool mp3_open(audio_decoder_t *iface, const char *path)
     d->info_done = false;
     d->in_off = 0;
     d->in_len = 0;
+    d->file_size = 0;
 
     {
         struct stat st;
         if(stat(path, &st)==0){
+            d->file_size = (uint32_t)st.st_size;
             printf("[音频] 文件大小=%ld bytes, ID3偏移=%ld → MP3数据=%ld bytes\n",
                    (long)st.st_size, off, (long)st.st_size - off);
         }
@@ -184,6 +225,7 @@ static void mp3_close(audio_decoder_t *iface)
     if(d->file){ fclose(d->file); d->file = NULL; }
     if(d->mp3){ delete d->mp3; d->mp3 = NULL; }
     if(d->inbuf){ heap_caps_free(d->inbuf); d->inbuf = NULL; }
+    if(d->cover_data){ heap_caps_free(d->cover_data); d->cover_data = NULL; d->cover_size = 0; }
     d->in_off = 0;
     d->in_len = 0;
     d->eof    = false;
@@ -199,6 +241,53 @@ static uint8_t mp3_get_channels(audio_decoder_t *iface)
     return ((decoder_mp3_t *)iface)->channels;
 }
 
+static uint32_t mp3_get_bitrate(audio_decoder_t *iface)
+{
+    decoder_mp3_t *d = (decoder_mp3_t *)iface;
+    return d->mp3 ? d->mp3->get_bitrate() : 0;
+}
+
+static uint32_t mp3_get_file_size(audio_decoder_t *iface)
+{
+    return ((decoder_mp3_t *)iface)->file_size;
+}
+
+static uint32_t mp3_get_position(audio_decoder_t *iface)
+{
+    decoder_mp3_t *d = (decoder_mp3_t *)iface;
+    if (!d->file) return 0;
+    long pos = ftell(d->file);
+    return pos > 0 ? (uint32_t)pos : 0;
+}
+
+static const char *mp3_get_title(audio_decoder_t *iface)
+{
+    return ((decoder_mp3_t *)iface)->title;
+}
+
+static const char *mp3_get_artist(audio_decoder_t *iface)
+{
+    return ((decoder_mp3_t *)iface)->artist;
+}
+
+static const uint8_t *mp3_get_cover_data(audio_decoder_t *iface)
+{
+    return ((decoder_mp3_t *)iface)->cover_data;
+}
+
+static size_t mp3_get_cover_size(audio_decoder_t *iface)
+{
+    return ((decoder_mp3_t *)iface)->cover_size;
+}
+
+/* 所有权移交给封面模块后, 标记解码器不再持有, 避免 close 时重复释放 */
+static void mp3_take_cover(audio_decoder_t *iface)
+{
+    decoder_mp3_t *d = (decoder_mp3_t *)iface;
+    d->cover_data = NULL;
+    d->cover_size = 0;
+}
+
 audio_decoder_t *decoder_mp3_create(void)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)calloc(1, sizeof(decoder_mp3_t));
@@ -210,6 +299,14 @@ audio_decoder_t *decoder_mp3_create(void)
     d->iface.close           = mp3_close;
     d->iface.get_sample_rate = mp3_get_sample_rate;
     d->iface.get_channels    = mp3_get_channels;
+    d->iface.get_bitrate     = mp3_get_bitrate;
+    d->iface.get_file_size   = mp3_get_file_size;
+    d->iface.get_position    = mp3_get_position;
+    d->iface.get_title       = mp3_get_title;
+    d->iface.get_artist      = mp3_get_artist;
+    d->iface.get_cover_data  = mp3_get_cover_data;
+    d->iface.get_cover_size  = mp3_get_cover_size;
+    d->iface.take_cover      = mp3_take_cover;
 
     return &d->iface;
 }

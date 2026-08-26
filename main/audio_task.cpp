@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <cstdlib>
+#include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -11,32 +12,38 @@
 #include "esp_timer.h"
 #include "audio_task.h"
 #include "decoder.h"
+#include "pcm_pipeline.h"
+#include "song_info.h"
 #include "atomic_utils.h"
+#include "cover.h"
 
 #define AUDIO_TAG "AUDIO"
-
-#define PCM_DEADLINE_US    100000
 
 /* MPEG1 stereo: 1152 samples × 2ch = 2304 int16_t */
 #define MP3_PCM_BUF_SAMPLES  (1152 * 2)
 
+/* 44.1kHz stereo 16bit 输出缓冲, 容纳最坏重采样结果 */
+#define PCM_OUT_BUF_SAMPLES  (4096 * 2)
+
 extern "C" {
 volatile bool g_pcm_active = false;
+song_info_t g_song_info = {};
+volatile bool g_song_info_valid = false;
 }
 
 typedef enum {
     STATE_IDLE = 0,
     STATE_PLAYING,
-    STATE_CHECKING,
+    STATE_PAUSED,
 } audio_state_t;
 
 static QueueHandle_t        s_cmd_queue   = NULL;
 static QueueHandle_t        s_rsp_queue   = NULL;
 static StreamBufferHandle_t s_pcm_stream  = NULL;
 static audio_state_t        s_state       = STATE_IDLE;
-static bool                 s_was_playing = false;
 
 static audio_decoder_t     *s_decoder     = NULL;
+static char                 s_current_path[256];
 
 /* ── PCM 输出 ── */
 static bool     s_pending_pcm = false;
@@ -44,9 +51,145 @@ static int16_t  s_pcm_buf[MP3_PCM_BUF_SAMPLES];
 static size_t   s_pcm_bytes   = 0;
 static size_t   s_pcm_offset  = 0;
 
+/* ── 解码 -> 蓝牙 中间转换层 ── */
+static pcm_pipeline_t *s_pipeline  = NULL;
+static uint32_t        s_pipe_rate = 0;
+static uint8_t         s_pipe_ch   = 0;
+static int16_t         s_out_buf[PCM_OUT_BUF_SAMPLES];
+static size_t          s_out_bytes = 0;
+static bool            s_info_done = false;
+
 static uint64_t s_total_decoded = 0;
 static uint64_t s_total_sent    = 0;
 static int64_t  s_play_start_us = 0;
+
+/* ── 辅助函数 ── */
+static void close_decoder(void)
+{
+    if (s_decoder) {
+        s_decoder->close(s_decoder);
+        free(s_decoder);
+        s_decoder = NULL;
+    }
+}
+
+static bool open_decoder(const char *path)
+{
+    s_decoder = decoder_mp3_create();
+    if (!s_decoder) {
+        printf("[音频] 创建解码器失败\n");
+        return false;
+    }
+    if (!s_decoder->open(s_decoder, path)) {
+        printf("[音频] 无法打开 %s\n", path);
+        free(s_decoder);
+        s_decoder = NULL;
+        return false;
+    }
+    strncpy(s_current_path, path, sizeof(s_current_path) - 1);
+    s_current_path[sizeof(s_current_path) - 1] = '\0';
+
+    /* 有封面则交给解码任务 (所有权移交, 解码完成后释放) */
+    const uint8_t *cd = s_decoder->get_cover_data ? s_decoder->get_cover_data(s_decoder) : NULL;
+    size_t cs = s_decoder->get_cover_size ? s_decoder->get_cover_size(s_decoder) : 0;
+    if (cd && cs > 0) {
+        cover_submit_job(cd, cs);
+        s_decoder->take_cover(s_decoder);
+    }
+
+    printf("[音频] 解码器已加载: %s\n", path);
+    return true;
+}
+
+static void set_format_from_path(const char *path)
+{
+    const char *fmt = "MP3";
+    const char *dot = strrchr(path, '.');
+    if (dot) {
+        if      (strcasecmp(dot, ".flac") == 0) fmt = "FLAC";
+        else if (strcasecmp(dot, ".wav")  == 0) fmt = "WAV";
+        else if (strcasecmp(dot, ".aac")  == 0) fmt = "AAC";
+        else if (strcasecmp(dot, ".mp3")  == 0) fmt = "MP3";
+    }
+    strncpy(g_song_info.format, fmt, SONG_FORMAT_MAX - 1);
+    g_song_info.format[SONG_FORMAT_MAX - 1] = '\0';
+}
+
+static void update_duration_elapsed(void)
+{
+    uint32_t kbps = s_decoder->get_bitrate(s_decoder);
+    uint32_t bps  = kbps * 125;
+    if (bps == 0) bps = 128 * 125;
+
+    g_song_info.bitrate_kbps = kbps ? kbps : 128;
+    g_song_info.duration_sec = s_decoder->get_file_size(s_decoder) / bps;
+    g_song_info.elapsed_sec  = s_decoder->get_position(s_decoder) / bps;
+}
+
+static void fill_song_info(void)
+{
+    const char *title  = s_decoder->get_title(s_decoder);
+    const char *artist = s_decoder->get_artist(s_decoder);
+
+    if (title && title[0]) {
+        strncpy(g_song_info.title, title, SONG_TITLE_MAX - 1);
+        g_song_info.title[SONG_TITLE_MAX - 1] = '\0';
+    } else {
+        const char *base = strrchr(s_current_path, '/');
+        base = base ? base + 1 : s_current_path;
+        strncpy(g_song_info.title, base, SONG_TITLE_MAX - 1);
+        g_song_info.title[SONG_TITLE_MAX - 1] = '\0';
+        char *dot = strrchr(g_song_info.title, '.');
+        if (dot) *dot = '\0';
+    }
+
+    if (artist && artist[0]) {
+        strncpy(g_song_info.artist, artist, SONG_ARTIST_MAX - 1);
+        g_song_info.artist[SONG_ARTIST_MAX - 1] = '\0';
+    } else {
+        g_song_info.artist[0] = '\0';
+    }
+
+    set_format_from_path(s_current_path);
+
+    g_song_info.sample_rate  = s_decoder->get_sample_rate(s_decoder);
+    g_song_info.channels     = s_decoder->get_channels(s_decoder);
+    update_duration_elapsed();
+
+    atomic_store_bool(&g_song_info_valid, true);
+    printf("[音频] 信息: %s | %s | %s | %" PRIu32 "Hz/%uch/%" PRIu32 "kbps | %" PRIu32 "s\n",
+           g_song_info.title, g_song_info.artist, g_song_info.format,
+           g_song_info.sample_rate, g_song_info.channels,
+           g_song_info.bitrate_kbps, g_song_info.duration_sec);
+}
+
+/* 启动播放: 需要则切换解码器; 失败则发 FILE_NOT_FOUND 并停在 IDLE */
+static void start_play(const char *path)
+{
+    if (s_decoder && strcmp(s_current_path, path) != 0) {
+        close_decoder();
+    }
+    if (!s_decoder) {
+        if (!open_decoder(path)) {
+            audio_rsp_t rsp;
+            rsp.type = AUDIO_RSP_FILE_NOT_FOUND;
+            xQueueSend(s_rsp_queue, &rsp, 0);
+            s_state = STATE_IDLE;
+            return;
+        }
+    }
+
+    atomic_store_bool(&g_song_info_valid, false);
+    s_pipe_rate = 0;
+    s_pipe_ch   = 0;
+    s_info_done = false;
+    s_pending_pcm = false;
+    s_total_decoded = 0;
+    s_total_sent = 0;
+    s_play_start_us = esp_timer_get_time();
+    s_state = STATE_PLAYING;
+    printf("[音频] 进入STATE_PLAYING | ts=%lld us\n", s_play_start_us);
+}
 
 /* ──────────────────────────────────────────────
  *  音频任务
@@ -54,165 +197,185 @@ static int64_t  s_play_start_us = 0;
 static void audio_task(void *arg)
 {
     audio_cmd_t cmd;
-    audio_rsp_t rsp;
 
-    while(1){
+    while (1) {
         atomic_store_bool(&g_pcm_active, (s_state == STATE_PLAYING));
 
-        switch(s_state){
+        switch (s_state) {
 
         case STATE_IDLE:
-            if(xQueueReceive(s_cmd_queue,&cmd,0)!=pdTRUE){vTaskDelay(pdMS_TO_TICKS(10));break;}
+            if (xQueueReceive(s_cmd_queue, &cmd, 0) != pdTRUE) { vTaskDelay(pdMS_TO_TICKS(10)); break; }
 
-            switch(cmd.type){
+            switch (cmd.type) {
             case AUDIO_CMD_PLAY:
-                if(s_decoder){
-                    /* 已有解码器, 可能是 PAUSE 恢复 */
-                } else {
-                    s_decoder = decoder_mp3_create();
-                    if(!s_decoder){printf("[音频] 创建解码器失败\n");break;}
-                    if(!s_decoder->open(s_decoder, cmd.path)){
-                        printf("[音频] 无法打开 %s\n",cmd.path);
-                        free(s_decoder);
-                        s_decoder=NULL;
-                        break;
-                    }
-                    printf("[音频] 解码器已加载\n");
-                }
-                s_state=STATE_PLAYING; s_was_playing=true; s_pending_pcm=false;
-                s_total_decoded=0; s_total_sent=0; s_play_start_us=esp_timer_get_time();
-                printf("[音频] 进入STATE_PLAYING | ts=%lld us\n", s_play_start_us);
+                start_play(cmd.path);
                 break;
-
-            case AUDIO_CMD_BT_CONNECTED:
-                if(s_was_playing){s_state=STATE_PLAYING;} break;
-
             case AUDIO_CMD_STOP:
-            case AUDIO_CMD_PAUSE:
-                s_was_playing=false; s_pending_pcm=false;
-                xStreamBufferReset(s_pcm_stream);
-                if(cmd.type==AUDIO_CMD_STOP && s_decoder){
-                    s_decoder->close(s_decoder);
-                    free(s_decoder);
-                    s_decoder=NULL;
-                }
+                close_decoder();
+                atomic_store_bool(&g_song_info_valid, false);
                 break;
-
-            default: break;
+            case AUDIO_CMD_PAUSE:
+            case AUDIO_CMD_BT_CONNECTED:
+            case AUDIO_CMD_BT_DISCONNECTED:
+            default:
+                break;
             }
             break;
 
         /* ─── 播放中 ─── */
         case STATE_PLAYING: {
-            if(!s_pending_pcm){
-                if(!s_decoder){
-                    s_state=STATE_IDLE;
+            /* (1) 先查队列命令(非阻塞) */
+            bool changed = false;
+            while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdTRUE) {
+                switch (cmd.type) {
+                case AUDIO_CMD_PLAY:
+                    if (strcmp(s_current_path, cmd.path) != 0) {
+                        xStreamBufferReset(s_pcm_stream);
+                        s_pending_pcm = false;
+                        start_play(cmd.path);
+                    }
+                    break;
+                case AUDIO_CMD_STOP:
+                    xStreamBufferReset(s_pcm_stream); s_pending_pcm = false;
+                    close_decoder();
+                    atomic_store_bool(&g_song_info_valid, false);
+                    s_state = STATE_IDLE;
+                    break;
+                case AUDIO_CMD_PAUSE:
+                    xStreamBufferReset(s_pcm_stream); s_pending_pcm = false;
+                    /* 暂停只停 PCM 输出, 音乐头信息仍要解析 */
+                    if (s_decoder && !s_info_done) {
+                        size_t bytes = 0;
+                        if (s_decoder->decode(s_decoder, s_pcm_buf, &bytes) && bytes > 0) {
+                            fill_song_info();
+                            s_info_done = true;
+                        }
+                    }
+                    s_state = STATE_PAUSED;
+                    break;
+                case AUDIO_CMD_BT_DISCONNECTED:
+                    xStreamBufferReset(s_pcm_stream); s_pending_pcm = false;
+                    s_state = STATE_PAUSED;
+                    break;
+                default:
                     break;
                 }
-                if(!s_decoder->decode(s_decoder, s_pcm_buf, &s_pcm_bytes)){
-                    if(s_decoder->is_eof(s_decoder)){
+                if (s_state != STATE_PLAYING) { changed = true; break; }
+            }
+            if (changed) break;
+
+            /* (2) 无待发 PCM → 解码一帧 */
+            if (!s_pending_pcm) {
+                if (!s_decoder) {
+                    s_state = STATE_IDLE;
+                    break;
+                }
+                if (!s_decoder->decode(s_decoder, s_pcm_buf, &s_pcm_bytes)) {
+                    if (s_decoder->is_eof(s_decoder)) {
                         int64_t elapsed = esp_timer_get_time() - s_play_start_us;
                         printf("[音频] 播放完毕 | 解码=%" PRIu64 " 发送=%" PRIu64 " 耗时=%lld us (%.2f s)\n",
                                s_total_decoded, s_total_sent, elapsed, elapsed / 1000000.0);
-                        s_decoder->close(s_decoder);
-                        free(s_decoder);
-                        s_decoder=NULL;
-                        s_state=STATE_IDLE;
+                        close_decoder();
+                        atomic_store_bool(&g_song_info_valid, false);
+                        s_state = STATE_IDLE;
+
+                        audio_rsp_t rsp;
+                        rsp.type = AUDIO_RSP_SONG_FINISHED;
+                        xQueueSend(s_rsp_queue, &rsp, 0);
                         break;
                     }
                     vTaskDelay(pdMS_TO_TICKS(10));
                     break;
                 }
                 s_total_decoded += s_pcm_bytes;
-                s_pending_pcm=true;
-                s_pcm_offset=0;
-            }
 
-            {
-                int64_t deadline = esp_timer_get_time() + PCM_DEADLINE_US;
-                bool timed_out = false;
-
-                while(s_pcm_offset < s_pcm_bytes){
-                    size_t written = xStreamBufferSend(s_pcm_stream,
-                        (const uint8_t*)s_pcm_buf + s_pcm_offset,
-                        s_pcm_bytes - s_pcm_offset, 0);
-
-                    vTaskDelay(pdMS_TO_TICKS(5));
-
-                    if(written > 0){
-                        s_pcm_offset += written;
-                        deadline = esp_timer_get_time() + PCM_DEADLINE_US;
-                        continue;
-                    }
-
-
-                    if(esp_timer_get_time() > deadline){
-                        printf("[音频] PCM超时! 已写=%zu/%zu 累计发送=%" PRIu64 "\n",
-                               s_pcm_offset, s_pcm_bytes, s_total_sent);
-                        rsp.type=AUDIO_RSP_BT_CHECK;
-                        xQueueSend(s_rsp_queue,&rsp,0);
-                        s_state=STATE_CHECKING;
-                        timed_out=true;
+                uint32_t rate = s_decoder->get_sample_rate(s_decoder);
+                uint8_t  ch   = s_decoder->get_channels(s_decoder);
+                if (!s_pipeline) {
+                    s_pipeline = pcm_pipeline_create();
+                    if (!s_pipeline) {
+                        printf("[音频] 转换层创建失败\n");
+                        close_decoder();
+                        atomic_store_bool(&g_song_info_valid, false);
+                        s_state = STATE_IDLE;
                         break;
                     }
-
-                    while(xQueueReceive(s_cmd_queue,&cmd,0)==pdTRUE){
-                        switch(cmd.type){
-                        case AUDIO_CMD_STOP:
-                            xStreamBufferReset(s_pcm_stream); s_pending_pcm=false;
-                            if(s_decoder){s_decoder->close(s_decoder);free(s_decoder);s_decoder=NULL;}
-                            s_state=STATE_IDLE; s_was_playing=false; break;
-                        case AUDIO_CMD_PAUSE:
-                            xStreamBufferReset(s_pcm_stream); s_pending_pcm=false;
-                            s_state=STATE_IDLE; break;
-                        case AUDIO_CMD_BT_DISCONNECTED:
-                            xStreamBufferReset(s_pcm_stream); s_pending_pcm=false;
-                            if(s_decoder){s_decoder->close(s_decoder);free(s_decoder);s_decoder=NULL;}
-                            s_state=STATE_IDLE; break;
-                        default: break;
-                        }
-                        if(s_state!=STATE_PLAYING)break;
+                }
+                if (rate != s_pipe_rate || ch != s_pipe_ch) {
+                    if (!pcm_pipeline_open(s_pipeline, rate, 16, ch)) {
+                        printf("[音频] 转换层初始化失败 rate=%" PRIu32 " ch=%u\n", rate, ch);
+                        close_decoder();
+                        atomic_store_bool(&g_song_info_valid, false);
+                        s_state = STATE_IDLE;
+                        break;
                     }
-                    if(s_state!=STATE_PLAYING)break;
+                    s_pipe_rate = rate;
+                    s_pipe_ch   = ch;
+                    printf("[音频] 转换层: %" PRIu32 "Hz/%uch -> 44100Hz/2ch\n", rate, ch);
                 }
 
-                if(timed_out || s_state!=STATE_PLAYING) break;
-
-                s_total_sent += s_pcm_bytes;
-                s_pending_pcm=false;
-            }
-
-            while(xQueueReceive(s_cmd_queue,&cmd,0)==pdTRUE){
-                switch(cmd.type){
-                case AUDIO_CMD_STOP:
-                    xStreamBufferReset(s_pcm_stream); s_pending_pcm=false;
-                    if(s_decoder){s_decoder->close(s_decoder);free(s_decoder);s_decoder=NULL;}
-                    s_state=STATE_IDLE; s_was_playing=false; break;
-                case AUDIO_CMD_PAUSE:
-                    xStreamBufferReset(s_pcm_stream); s_pending_pcm=false;
-                    s_state=STATE_IDLE; break;
-                case AUDIO_CMD_BT_DISCONNECTED:
-                    xStreamBufferReset(s_pcm_stream); s_pending_pcm=false;
-                    if(s_decoder){s_decoder->close(s_decoder);free(s_decoder);s_decoder=NULL;}
-                    s_state=STATE_IDLE; break;
-                default: break;
+                if (!s_info_done) {
+                    fill_song_info();
+                    s_info_done = true;
+                } else {
+                    update_duration_elapsed();
                 }
-                if(s_state!=STATE_PLAYING)break;
+
+                size_t frames = s_pcm_bytes / (ch * 2);
+                s_out_bytes = pcm_pipeline_process(s_pipeline, s_pcm_buf, frames,
+                                                   (uint8_t*)s_out_buf, sizeof(s_out_buf));
+
+                s_pending_pcm = true;
+                s_pcm_offset = 0;
             }
+
+            /* (3) 非阻塞填入 PCM, 填多少算多少 */
+            {
+                size_t written = xStreamBufferSend(s_pcm_stream,
+                    (const uint8_t*)s_out_buf + s_pcm_offset,
+                    s_out_bytes - s_pcm_offset, 0);
+                if (written > 0) {
+                    s_pcm_offset += written;
+                }
+            }
+
+            /* (4) 未填完 → 释放 CPU 10ms 回主循环(下轮只查命令+继续填, 不解码) */
+            if (s_pcm_offset < s_out_bytes) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                break;
+            }
+
+            /* (5) 已填完 → 清 pending, 下轮进入解码 */
+            s_total_sent += s_out_bytes;
+            s_pending_pcm = false;
             break;
         }
 
-        case STATE_CHECKING:
-            if(xQueueReceive(s_cmd_queue,&cmd,0)!=pdTRUE){vTaskDelay(pdMS_TO_TICKS(10));break;}
-            switch(cmd.type){
-            case AUDIO_CMD_BT_CONNECTED: s_state=STATE_PLAYING; break;
-            case AUDIO_CMD_BT_DISCONNECTED:
-                if(s_decoder){s_decoder->close(s_decoder);free(s_decoder);s_decoder=NULL;}
-                s_state=STATE_IDLE; break;
+        /* ─── 暂停中 ─── */
+        case STATE_PAUSED:
+            if (xQueueReceive(s_cmd_queue, &cmd, 0) != pdTRUE) { vTaskDelay(pdMS_TO_TICKS(10)); break; }
+
+            switch (cmd.type) {
+            case AUDIO_CMD_PLAY:
+                if (s_decoder && strcmp(s_current_path, cmd.path) == 0) {
+                    /* 同一首歌: 纯续播, 不清状态不再解析 */
+                    s_pending_pcm = false;
+                    s_state = STATE_PLAYING;
+                    printf("[音频] 恢复播放\n");
+                } else {
+                    start_play(cmd.path);
+                }
+                break;
             case AUDIO_CMD_STOP:
-                if(s_decoder){s_decoder->close(s_decoder);free(s_decoder);s_decoder=NULL;}
-                s_state=STATE_IDLE; s_was_playing=false; break;
-            default: break;
+                close_decoder();
+                atomic_store_bool(&g_song_info_valid, false);
+                s_state = STATE_IDLE;
+                break;
+            case AUDIO_CMD_PAUSE:
+            case AUDIO_CMD_BT_CONNECTED:
+            case AUDIO_CMD_BT_DISCONNECTED:
+            default:
+                break;
             }
             break;
         }
@@ -221,8 +384,8 @@ static void audio_task(void *arg)
 
 extern "C" void audio_task_init(const audio_task_params_t *params)
 {
-    s_cmd_queue=params->cmd_queue;
-    s_rsp_queue=params->rsp_queue;
-    s_pcm_stream=params->pcm_stream;
-    xTaskCreatePinnedToCore(audio_task,"audio",4096,NULL,1,NULL,0);
+    s_cmd_queue  = params->cmd_queue;
+    s_rsp_queue  = params->rsp_queue;
+    s_pcm_stream = params->pcm_stream;
+    xTaskCreatePinnedToCore(audio_task, "audio", 4096, NULL, 1, NULL, 0);
 }

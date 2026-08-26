@@ -6,6 +6,9 @@
 void fs_menu_click_cb(lv_event_t *e);
 void fs_browser_on_sd_ready(void);
 void fs_browser_on_sd_remove(void);
+void fs_list_set_play_cb(void (*cb)(const char *group, const char *name));
+void fs_browser_refresh(void);
+void fs_browser_jump(void);
 
 void bt_list_init(bt_a2dp_iface_t *iface);
 void bt_menu_click_cb(lv_event_t *e);

@@ -16,6 +16,14 @@ typedef struct audio_decoder_s {
     void      (*close)(struct audio_decoder_s *self);
     uint32_t  (*get_sample_rate)(struct audio_decoder_s *self);
     uint8_t   (*get_channels)(struct audio_decoder_s *self);
+    uint32_t  (*get_bitrate)(struct audio_decoder_s *self);
+    uint32_t  (*get_file_size)(struct audio_decoder_s *self);
+    uint32_t  (*get_position)(struct audio_decoder_s *self);
+    const char *(*get_title)(struct audio_decoder_s *self);
+    const char *(*get_artist)(struct audio_decoder_s *self);
+    const uint8_t *(*get_cover_data)(struct audio_decoder_s *self);
+    size_t         (*get_cover_size)(struct audio_decoder_s *self);
+    void           (*take_cover)(struct audio_decoder_s *self);
 } audio_decoder_t;
 
 audio_decoder_t *decoder_mp3_create(void);

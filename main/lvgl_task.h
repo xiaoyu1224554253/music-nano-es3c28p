@@ -14,4 +14,8 @@ typedef struct {
 
 void lvgl_task_init(const lvgl_task_params_t *params);
 
+/* 当前播放信息: 供文件浏览器定位正在播放的歌曲 (无歌曲时返回 NULL) */
+const char *player_current_group(void);
+const char *player_current_name(void);
+
 #endif

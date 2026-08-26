@@ -12,6 +12,7 @@ typedef enum {
     APP_CMD_STOP         = 4,
     APP_CMD_PAUSE        = 5,
     APP_CMD_INFO         = 6,
+    APP_CMD_COVER_READY  = 7,
 } app_cmd_type_t;
 
 typedef struct {
