@@ -5,8 +5,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "micro_mp3/mp3_decoder.h"
-#include "decoder.h"
-#include "song_info.h"
+#include "audio.h"
 
 #define MP3_TAG "DEC_MP3"
 #define MP3_INPUT_CHUNK_SIZE 2048

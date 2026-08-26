@@ -15,7 +15,8 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   lvgl/lvgl: ==8.3.11
-  mydazy/esp_lcd_jd9853: ^2.0.0
-  esphome/micro-mp3: ^0.4.0
-  bitbank2/jpegdec: ^1.6.2
-  esphome/esp-audio-libs: ^3.2.1
+  mydazy/esp_lcd_jd9853: ==2.0.0
+  esphome/micro-mp3: ==0.4.0
+  bitbank2/jpegdec: ==1.6.2
+  esphome/esp-audio-libs: ==3.2.1
+  esphome/micro-flac: ==0.2.0

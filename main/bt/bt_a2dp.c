@@ -16,7 +16,7 @@
 #include "bt_a2dp.h"
 #include "audio_task.h"
 #include "atomic_utils.h"
-#include "volume.h"
+#include "settings.h"
 
 #define BT_TAG              "BT_A2DP"
 #define RC_TAG              "BT_RC"
@@ -601,7 +601,7 @@ static void bt_a2dp_task(void *arg)
 
     s_iface.cmd_queue  = xQueueCreate(10, sizeof(bt_cmd_t));
     s_iface.evt_queue  = xQueueCreate(20, sizeof(bt_evt_t));
-    s_iface.pcm_stream = xStreamBufferCreate(16 * 1024, 512);
+    s_iface.pcm_stream = xStreamBufferCreate(24 * 1024, 512);
 
     s_dispatch_queue = xQueueCreate(10, sizeof(bt_dispatch_msg_t));
     s_queue_set      = xQueueCreateSet(8);

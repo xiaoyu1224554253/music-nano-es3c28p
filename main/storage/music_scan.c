@@ -1,4 +1,4 @@
-#include <string.h>
+﻿#include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -9,7 +9,6 @@
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "ff.h"
-#include "music_scanner.h"
 
 #define TAG_MUSIC_SCAN   "MUSIC_SCAN"
 
@@ -218,8 +217,16 @@ static void scan_dir(const char *dir_path)
 
         if (entry->d_type == DT_REG) {
             if (is_music_file(entry->d_name)) {
-                write(fd, entry->d_name, strlen(entry->d_name));
-                write(fd, "\n", 1);
+                /* 跳过 0 字节的损坏/残留文件 */
+                char full[512];
+                snprintf(full, sizeof(full), "%s/%s", dir_path, entry->d_name);
+                struct stat st;
+                if (stat(full, &st) == 0 && st.st_size > 0) {
+                    write(fd, entry->d_name, strlen(entry->d_name));
+                    write(fd, "\n", 1);
+                } else {
+                    ESP_LOGW(TAG_MUSIC_SCAN, "跳过空文件: %s", full);
+                }
             }
         } else if (entry->d_type == DT_DIR) {
             char sub_path[384];
@@ -239,7 +246,7 @@ static void scan_dir(const char *dir_path)
     path_list_free(&subdirs);
 }
 
-static void music_scanner_scan(void)
+static void music_scan_run(void)
 {
     ESP_LOGI(TAG_MUSIC_SCAN, "开始扫描音乐文件...");
 
@@ -255,7 +262,7 @@ static void music_scanner_scan(void)
     ESP_LOGI(TAG_MUSIC_SCAN, "扫描完成, 耗时 %.2f ms", elapsed / 1000.0f);
 }
 
-void music_scanner_init(void)
+void music_scan_init(void)
 {
     ESP_LOGI(TAG_MUSIC_SCAN, "初始化音乐文件扫描器");
 
@@ -272,7 +279,7 @@ void music_scanner_init(void)
 
     if (cached_used == 0) {
         ESP_LOGI(TAG_MUSIC_SCAN, "无缓存记录，开始全量扫描");
-        music_scanner_scan();
+        music_scan_run();
         return;
     }
 
@@ -281,7 +288,7 @@ void music_scanner_init(void)
     if (diff > SPACE_THRESHOLD_KB) {
         ESP_LOGI(TAG_MUSIC_SCAN, "空间变化 %lld KB 超过阈值 %d KB，重新扫描",
                  diff, SPACE_THRESHOLD_KB);
-        music_scanner_scan();
+        music_scan_run();
     } else {
         ESP_LOGI(TAG_MUSIC_SCAN, "空间变化在阈值内，使用缓存");
     }

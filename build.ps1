@@ -64,7 +64,7 @@ try {
     elseif ($line -match "FAILED|ninja:") {
         Write-Host $line -ForegroundColor Red
     }
-    elseif ($line -match "Linking|Generating|esptool|binary size|Completed|bootloader") {
+    elseif ($line -match "binary size") {
         Write-Host $line -ForegroundColor Green
     }
     }

@@ -17,8 +17,6 @@
 #include "esp_heap_caps.h"
 #include "atomic_utils.h"
 #include "sys_monitor.h"
-#include "music_scanner.h"
-#include "volume.h"
 
 #define TAG_SDMMC   "SDMMC"
 #define TAG_DETECT  "SD_DETECT"
@@ -26,9 +24,6 @@
 
 #define MOUNT_POINT  "/sdcard"
 #define PIN_SD_DETECT 13
-#define PIN_VOL_UP    36
-#define PIN_VOL_DOWN  38
-#define VOLUME_STEP   8
 
 #define PIN_CLK 14
 #define PIN_CMD 15
@@ -335,7 +330,7 @@ void sdmmc_disk_init(void)
     ESP_LOGI(TAG_SDMMC, "SD 卡已挂载");
 
     sd_scan_files();
-    music_scanner_init();
+    music_scan_init();
 
     s_fs_cache_owned = sd_load_cache_to_psram();
     g_fs_cache = s_fs_cache_owned;
@@ -417,8 +412,6 @@ static void sample_sensors(void)
 static void sys_monitor_task(void *arg)
 {
     gpio_set_direction(PIN_SD_DETECT, GPIO_MODE_INPUT);
-    gpio_set_direction(PIN_VOL_UP, GPIO_MODE_INPUT);
-    gpio_set_direction(PIN_VOL_DOWN, GPIO_MODE_INPUT);
 
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = VBAT_ADC_UNIT,
@@ -455,14 +448,6 @@ static void sys_monitor_task(void *arg)
         }
 
         last = current;
-
-        /* 音量按键: 高电平(外部下拉)即增减 */
-        if (gpio_get_level(PIN_VOL_UP) == 1) {
-            volume_inc(VOLUME_STEP);
-        }
-        if (gpio_get_level(PIN_VOL_DOWN) == 1) {
-            volume_inc(-VOLUME_STEP);
-        }
 
         if (++tick >= SENSOR_INTERVAL_TICKS) {
             tick = 0;

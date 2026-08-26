@@ -11,9 +11,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "audio_task.h"
-#include "decoder.h"
+#include "audio.h"
 #include "pcm_pipeline.h"
-#include "song_info.h"
 #include "atomic_utils.h"
 #include "cover.h"
 
@@ -75,7 +74,12 @@ static void close_decoder(void)
 
 static bool open_decoder(const char *path)
 {
-    s_decoder = decoder_mp3_create();
+    const char *dot = strrchr(path, '.');
+    if (dot && strcasecmp(dot, ".flac") == 0) {
+        s_decoder = decoder_flac_create();
+    } else {
+        s_decoder = decoder_mp3_create();
+    }
     if (!s_decoder) {
         printf("[音频] 创建解码器失败\n");
         return false;
@@ -264,6 +268,13 @@ static void audio_task(void *arg)
                         g_song_info.elapsed_sec =
                             (uint64_t)g_song_info.duration_sec * cmd.param / 1000;
                     }
+                    break;
+                case AUDIO_CMD_BT_CONNECTED:
+                    /* 连接建立时清空旧流, 让 A2DP 从帧边界起全新数据开编 (修复沙沙声) */
+                    xStreamBufferReset(s_pcm_stream);
+                    s_pending_pcm = false;
+                    s_pcm_offset = 0;
+                    printf("[音频] BT 已连接, 重置 PCM 流\n");
                     break;
                 case AUDIO_CMD_BT_DISCONNECTED:
                     xStreamBufferReset(s_pcm_stream); s_pending_pcm = false;

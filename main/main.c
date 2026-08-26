@@ -3,8 +3,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "nvs_flash.h"
-#include "sys_serial.h"
-#include "lvgl_task.h"
+#include "app.h"
+#include "ui_core.h"
 #include "audio_task.h"
 #include "bt_a2dp.h"
 #include "sys_monitor.h"
@@ -28,15 +28,15 @@ void app_main(void)
         return;
     }
 
-    sys_serial_init(s_app_cmd_queue);
+    console_init(s_app_cmd_queue);
 
-    lvgl_task_params_t lvgl_params = {
+    ui_params_t ui_params = {
         .app_cmd_queue   = s_app_cmd_queue,
         .bt_iface        = bt_iface,
         .audio_cmd_queue = s_audio_cmd_queue,
         .audio_rsp_queue = s_audio_rsp_queue,
     };
-    lvgl_task_init(&lvgl_params);
+    ui_core_init(&ui_params);
 
     audio_task_params_t audio_params = {
         .cmd_queue  = s_audio_cmd_queue,

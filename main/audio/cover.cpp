@@ -6,7 +6,7 @@
 #include "esp_log.h"
 #include "JPEGDEC.h"
 #include "cover.h"
-#include "sys_serial.h"
+#include "app.h"
 
 /* 该组件只编译了 C API (JPEG_openRAM 等), 在此声明供 C++ 使用 */
 extern "C" {

@@ -6,3 +6,4 @@ dependencies.lock
 .devcontainer/
 *.pyc
 __pycache__/
+managed_components/

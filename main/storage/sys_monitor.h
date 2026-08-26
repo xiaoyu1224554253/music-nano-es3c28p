@@ -32,6 +32,9 @@ void sdmmc_disk_set_event_callback(sd_event_cb_t cb, void *user_data);
 
 void sys_monitor_init(void);
 
+/* 音乐文件扫描 (storage/music_scan.c): 生成缓存文件列表 */
+void music_scan_init(void);
+
 extern volatile bool   g_sd_ready;
 extern volatile float  g_vbat;
 extern volatile float  g_cpu_temp;

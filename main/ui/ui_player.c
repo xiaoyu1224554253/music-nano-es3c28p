@@ -1,67 +1,44 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
-#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
-#include "nvs.h"
-#include "esp_lcd_panel_ops.h"
 #include "esp_timer.h"
 #include "esp_random.h"
-#include "lcd_jd9853.h"
-#include "touch_cst816.h"
 #include "lvgl.h"
-#include "bt_a2dp.h"
-#include "sys_serial.h"
 #include "audio_task.h"
-#include "lvgl_task.h"
+#include "audio.h"
+#include "settings.h"
 #include "sys_monitor.h"
-#include "ui_list.h"
-#include "song_info.h"
-#include "last_song.h"
-#include "volume.h"
-#include <dirent.h>
-#include "esp_heap_caps.h"
-#include "File.h"
+#include "atomic_utils.h"
+#include "ui_core.h"
+#include "ui_player.h"
+#include "menu.h"
 
-extern const lv_font_t chinese_16;
+extern const lv_font_t lv_font_global_16;
 
-#define LVGL_TAG "LVGL"
+/* 音量按键: 高电平(外部下拉)即增减, 由 LVGL 独立定时器(10ms)轮询 */
+#define PIN_VOL_UP     36
+#define PIN_VOL_DOWN   38
+#define VOLUME_STEP    8
+#define VOL_KEY_POLL_MS 10                /* 轮询周期 10ms */
+#define VOL_KEY_MIN_MS 100                /* 两次触发最小间隔 */
 
-#define TFT_HOR_RES   172
-#define TFT_VER_RES   320
-#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 10 * 7)
-#define LVGL_BUF_SIZE  (DRAW_BUF_SIZE / 2)
+/* 音量弹窗: (140,45) 30x110, 变化时滑入显示, 2秒无变化滑出隐藏 */
+#define VOL_POP_X       140
+#define VOL_POP_Y       45
+#define VOL_POP_W       30
+#define VOL_POP_H       110
+#define VOL_POP_BAR_H   90
+#define VOL_POP_HIDE_MS 2000
+#define VOL_POP_ANIM_IN_MS   150   /* 滑入: overshoot 过冲(q弹), 从屏外冲到目标位再回落 */
+#define VOL_POP_ANIM_OUT_MS  100   /* 滑出: 线性匀速 */
 
-#define TOUCH_Y_MIN  5
-#define TOUCH_Y_MAX  310
-
-/* 忙跑策略: 每周期让出 CPU 喂 WDT + 同核任务运行 */
-#define LVGL_YIELD_PERIOD_US  (1000 * 1000)
-#define LVGL_YIELD_DUR_MS     10
-
-#define COLOR_BG      lv_color_hex(0x050505)
-#define COLOR_CARD    lv_color_hex(0x111111)
-#define COLOR_FG      lv_color_hex(0xF0F0F0)
-#define COLOR_MUTED   lv_color_hex(0x888888)
-#define COLOR_ACCENT  lv_color_hex(0x00D992)
-#define COLOR_BORDER  lv_color_hex(0x2A2A2A)
-#define COLOR_DIM     lv_color_hex(0x555555)
-
-static QueueHandle_t        s_app_cmd_queue  = NULL;
-static bt_a2dp_iface_t     *s_bt_iface       = NULL;
-static QueueHandle_t        s_audio_cmd_queue = NULL;
-static QueueHandle_t        s_audio_rsp_queue = NULL;
-static QueueSetHandle_t     s_queue_set       = NULL;
-static bool                 s_was_playing     = false;
-
-static lv_color_t           s_draw_buf1[LVGL_BUF_SIZE];
-static lv_color_t           s_draw_buf2[LVGL_BUF_SIZE];
-static lv_disp_draw_buf_t   s_draw_buf_dsc;
-static lv_disp_drv_t        s_disp_drv;
-static esp_lcd_panel_handle_t s_panel = NULL;
+/* 用户命令发送: 与上一条间隔 < 500ms 则丢弃 */
+#define CMD_MIN_INTERVAL_US  500000
 
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_title_label;
@@ -79,86 +56,34 @@ static lv_img_dsc_t s_cover_dsc;
 static lv_obj_t *s_play_icon;
 static lv_obj_t *s_mode_icon;
 
-/* 音量弹窗: (140,45) 30x110, 变化时显示, 2秒无变化隐藏 */
-#define VOL_POP_X       140
-#define VOL_POP_Y       45
-#define VOL_POP_W       30
-#define VOL_POP_H       110
-#define VOL_POP_BAR_H   90
-#define VOL_POP_HIDE_MS 2000
-
+/* 音量弹窗 */
 static lv_obj_t *s_vol_cont = NULL;
 static lv_obj_t *s_vol_bar  = NULL;
 static lv_obj_t *s_vol_val  = NULL;
 static int32_t   s_vol_last_ui = -1;
 static int       s_vol_idle = 0;
+typedef enum {
+    VOL_STATE_HIDDEN,
+    VOL_STATE_SHOWING,
+    VOL_STATE_HIDING,
+} vol_state_t;
+static vol_state_t s_vol_state = VOL_STATE_HIDDEN;
 
-static void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area,
-                          lv_color_t *color_p)
-{
-    esp_lcd_panel_draw_bitmap(s_panel, area->x1, area->y1,
-                              area->x2 + 1, area->y2 + 1, color_p);
-    lv_disp_flush_ready(disp_drv);
-}
-
-static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
-{
-    uint16_t tx, ty;
-    if (touch_read(&tx, &ty)) {
-        //printf("%d, %d\n", tx, ty);
-        ty = (uint16_t)(((int)ty - TOUCH_Y_MIN) * (TFT_VER_RES - 1)
-                        / (TOUCH_Y_MAX - TOUCH_Y_MIN));
-        tx = TFT_HOR_RES - 1 - tx;
-        ty = TFT_VER_RES - 1 - ty;
-        if (tx >= TFT_HOR_RES) tx = TFT_HOR_RES - 1;
-        if (ty >= TFT_VER_RES) ty = TFT_VER_RES - 1;
-        data->point.x = tx;
-        data->point.y = ty;
-        data->state = LV_INDEV_STATE_PR;
-    } else {
-        data->state = LV_INDEV_STATE_REL;
-    }
-}
-
-static lv_obj_t *make_icon_btn(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
-                                lv_coord_t w, lv_coord_t h,
-                                const char *symbol)
-{
-    lv_obj_t *btn = lv_btn_create(parent);
-    lv_obj_set_pos(btn, x, y);
-    lv_obj_set_size(btn, w, h);
-    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_bg_opa(btn, 8, 0);
-    lv_obj_set_style_border_width(btn, 0, 0);
-    lv_obj_set_style_shadow_width(btn, 0, 0);
-
-    lv_obj_t *icon = lv_label_create(btn);
-    lv_label_set_text(icon, symbol);
-    lv_obj_set_style_text_color(icon, COLOR_MUTED, 0);
-    lv_obj_center(icon);
-
-    return btn;
-}
-
-/* ── 播放列表: 当前文件夹联动 (仅读内存缓存 g_fs_cache, 不碰 SD) ── */
+/* 播放列表: 当前文件夹联动 (仅读内存缓存 g_fs_cache, 不碰 SD) */
 static char s_pl_group[FS_GROUP_MAX];
 static int  s_pl_index = 0;
 static int  s_pl_count = 0;
 
-/* ── 播放模式与命令节流 ── */
-typedef enum {
-    PLAY_MODE_SEQUENTIAL = 0,   /* 顺序(到头回绕) */
-    PLAY_MODE_SINGLE,           /* 单曲循环 */
-    PLAY_MODE_RANDOM,           /* 随机 */
-} play_mode_t;
-
 static play_mode_t s_play_mode = PLAY_MODE_SEQUENTIAL;
 static bool        s_auto_advancing = false;
 static int64_t     s_last_user_cmd_us = 0;
+static bool        s_was_playing = false;
 
-#define CMD_MIN_INTERVAL_US  500000
+/* ── 文件不存在提示弹窗 ── */
+static lv_obj_t *s_dialog = NULL;
+static void show_file_not_found(void);
 
+/* ── 播放列表辅助 ── */
 static int player_count_files(const char *group)
 {
     if (!g_fs_cache || !group) return 0;
@@ -216,7 +141,7 @@ static bool audio_user_send(const audio_cmd_t *cmd)
         return false;
     }
     s_last_user_cmd_us = now;
-    xQueueSend(s_audio_cmd_queue, cmd, 0);
+    xQueueSend(g_ui_audio_cmd_queue, cmd, 0);
     return true;
 }
 
@@ -237,6 +162,11 @@ static void cover_show(void *buf)
     lv_img_set_src(s_album_img, &s_cover_dsc);
     lv_obj_clear_flag(s_album_img, LV_OBJ_FLAG_HIDDEN);
     if (s_album_icon) lv_obj_add_flag(s_album_icon, LV_OBJ_FLAG_HIDDEN);
+}
+
+void player_show_cover(void *buf)
+{
+    cover_show(buf);
 }
 
 static void player_play_index(int idx)
@@ -274,7 +204,7 @@ static void player_play_index(int idx)
 }
 
 /* 自动切歌(歌曲播完 / 跳过未找到): 直接发送, 不节流 */
-static void player_advance(void)
+void player_advance(void)
 {
     if (s_pl_count <= 0) return;
 
@@ -309,7 +239,7 @@ static void player_advance(void)
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = AUDIO_CMD_PLAY;
     strncpy(cmd.path, path, sizeof(cmd.path) - 1);
-    xQueueSend(s_audio_cmd_queue, &cmd, 0);
+    xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
 
     s_pl_index = next;
     s_auto_advancing = true;
@@ -321,6 +251,31 @@ static void player_advance(void)
     /* 自动切歌同样记录路径并刷新浏览器高亮 */
     last_song_save(path);
     fs_browser_refresh();
+}
+
+void player_on_song_finished(void)
+{
+    s_auto_advancing = true;
+    player_advance();
+}
+
+void player_on_file_not_found(void)
+{
+    if (s_auto_advancing) {
+        player_advance();
+    } else {
+        show_file_not_found();
+    }
+}
+
+bool player_was_playing(void)
+{
+    return s_was_playing;
+}
+
+void player_set_was_playing(bool v)
+{
+    s_was_playing = v;
 }
 
 static void mode_update_icon(void)
@@ -342,34 +297,10 @@ static void mode_btn_click_cb(lv_event_t *e)
     mode_update_icon();
     printf("[LVGL] 播放模式: %d\n", s_play_mode);
 
-    /* 写入 NVS, 下次启动恢复 */
-    nvs_handle_t h;
-    if (nvs_open("player", NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, "play_mode", s_play_mode);
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    settings_mode_save(s_play_mode);
 }
 
-/* 启动时从 NVS 恢复播放模式, 返回是否成功 (供 UI 同步图标) */
-static bool mode_load_from_nvs(void)
-{
-    nvs_handle_t h;
-    if (nvs_open("player", NVS_READONLY, &h) != ESP_OK) return false;
-
-    int32_t m = PLAY_MODE_SEQUENTIAL;
-    esp_err_t ret = nvs_get_i32(h, "play_mode", &m);
-    nvs_close(h);
-
-    if (ret == ESP_OK && m >= PLAY_MODE_SEQUENTIAL && m <= PLAY_MODE_RANDOM) {
-        s_play_mode = (play_mode_t)m;
-        printf("[LVGL] 播放模式恢复: %d\n", s_play_mode);
-        return true;
-    }
-    return false;
-}
-
-static void player_play_file(const char *group, const char *name)
+void player_play_file(const char *group, const char *name)
 {
     if (!group || !name) return;
 
@@ -423,7 +354,7 @@ static void play_btn_click_cb(lv_event_t *e)
             memset(&cmd, 0, sizeof(cmd));
             cmd.type = AUDIO_CMD_PLAY;
             strncpy(cmd.path, path, sizeof(cmd.path) - 1);
-            xQueueSend(s_audio_cmd_queue, &cmd, 0);
+            xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
             s_was_playing = true;
             printf("[LVGL] RESUME: %s\n", path);
         }
@@ -431,9 +362,6 @@ static void play_btn_click_cb(lv_event_t *e)
         player_play_index(s_pl_index);
     }
 }
-
-/* ── 文件不存在提示弹窗 ── */
-static lv_obj_t *s_dialog = NULL;
 
 static void dialog_close_cb(lv_event_t *e)
 {
@@ -461,7 +389,7 @@ static void show_file_not_found(void)
 
     lv_obj_t *lbl = lv_label_create(s_dialog);
     lv_label_set_text(lbl, "该文件不存在");
-    lv_obj_set_style_text_font(lbl, &chinese_16, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_global_16, 0);
     lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
     lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 14);
 
@@ -477,7 +405,7 @@ static void show_file_not_found(void)
 
     lv_obj_t *btn_lbl = lv_label_create(btn);
     lv_label_set_text(btn_lbl, "确认");
-    lv_obj_set_style_text_font(btn_lbl, &chinese_16, 0);
+    lv_obj_set_style_text_font(btn_lbl, &lv_font_global_16, 0);
     lv_obj_set_style_text_color(btn_lbl, lv_color_black(), 0);
     lv_obj_center(btn_lbl);
 }
@@ -494,7 +422,7 @@ static void progress_slider_cb(lv_event_t *e)
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = AUDIO_CMD_SEEK;
     cmd.param = (uint32_t)lv_slider_get_value(s_progress_slider);
-    xQueueSend(s_audio_cmd_queue, &cmd, 0);
+    xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
     printf("[LVGL] SEEK: %" PRIu32 "%%\n", cmd.param / 10);
 }
 
@@ -554,7 +482,7 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
         audio_cmd_t cmd;
         memset(&cmd, 0, sizeof(cmd));
         cmd.type = AUDIO_CMD_STOP;
-        xQueueSend(s_audio_cmd_queue, &cmd, 0);
+        xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
         s_was_playing = false;
 
         /* 播放器状态复位: 残留的 SONG_FINISHED→advance 全部 no-op */
@@ -583,7 +511,7 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
                 audio_cmd_t cmd;
                 memset(&cmd, 0, sizeof(cmd));
                 cmd.type = AUDIO_CMD_PAUSE;
-                xQueueSend(s_audio_cmd_queue, &cmd, 0);
+                xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
 
                 fs_browser_jump();
             }
@@ -597,7 +525,7 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
 static void vol_popup_create(void)
 {
     s_vol_cont = lv_obj_create(lv_scr_act());
-    lv_obj_set_pos(s_vol_cont, VOL_POP_X, VOL_POP_Y);
+    lv_obj_set_pos(s_vol_cont, TFT_HOR_RES, VOL_POP_Y);  /* 初始在屏外, 由动画滑入 */
     lv_obj_set_size(s_vol_cont, VOL_POP_W, VOL_POP_H);
     lv_obj_set_style_bg_color(s_vol_cont, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(s_vol_cont, LV_OPA_COVER, 0);
@@ -606,6 +534,10 @@ static void vol_popup_create(void)
     lv_obj_set_style_shadow_width(s_vol_cont, 0, 0);
     lv_obj_set_style_pad_all(s_vol_cont, 0, 0);
     lv_obj_clear_flag(s_vol_cont, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(s_vol_cont, LV_SCROLLBAR_MODE_OFF);
+    /* 兜底: 滚动条透明(内容溢出时也不可见), 邪修方案 */
+    lv_obj_set_style_bg_opa(s_vol_cont, LV_OPA_TRANSP, LV_PART_SCROLLBAR | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(s_vol_cont, LV_OPA_TRANSP, LV_PART_SCROLLBAR | LV_STATE_SCROLLED);
 
     s_vol_bar = lv_bar_create(s_vol_cont);
     lv_obj_set_pos(s_vol_bar, (VOL_POP_W - 22) / 2, 4);
@@ -631,7 +563,53 @@ static void vol_popup_create(void)
     s_vol_last_ui = volume_get();
 }
 
-/* 音量轮询 (5Hz): 值变化则显示弹窗并写入 NVS, 2秒无变化自动隐藏 */
+/* 动画 exec 适配器: 直接把动画值设为弹窗 x 坐标 */
+static void vol_popup_set_x(void *obj, int32_t x)
+{
+    lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)x);
+}
+
+/* 音量弹窗: 从屏外滑入, overshoot 过冲(q弹)后回落目标位 */
+static void vol_popup_slide_in(void)
+{
+    lv_anim_del(s_vol_cont, NULL);   /* 中断可能进行中的滑出 */
+    lv_obj_move_foreground(s_vol_cont);
+    lv_obj_clear_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_vol_cont);
+    lv_anim_set_exec_cb(&a, vol_popup_set_x);
+    lv_anim_set_values(&a, TFT_HOR_RES, VOL_POP_X);
+    lv_anim_set_time(&a, VOL_POP_ANIM_IN_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
+    lv_anim_start(&a);
+    s_vol_state = VOL_STATE_SHOWING;
+}
+
+/* 滑出动画完成: 移出屏外后隐藏 */
+static void vol_popup_slide_out_end(lv_anim_t *a)
+{
+    lv_obj_add_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
+    s_vol_state = VOL_STATE_HIDDEN;
+}
+
+/* 音量弹窗: 匀速滑出屏外 */
+static void vol_popup_slide_out(void)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_vol_cont);
+    lv_anim_set_exec_cb(&a, vol_popup_set_x);
+    lv_anim_set_values(&a, lv_obj_get_x(s_vol_cont), TFT_HOR_RES);
+    lv_anim_set_time(&a, VOL_POP_ANIM_OUT_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_set_ready_cb(&a, vol_popup_slide_out_end);
+    lv_anim_start(&a);
+    s_vol_state = VOL_STATE_HIDING;
+}
+
+/* 音量轮询 (5Hz): 值变化则滑入弹窗并写入 NVS, 2秒无变化滑出隐藏 */
 static void volume_monitor_cb(lv_timer_t *timer)
 {
     int32_t v = volume_get();
@@ -639,27 +617,66 @@ static void volume_monitor_cb(lv_timer_t *timer)
     if (v != s_vol_last_ui) {
         s_vol_last_ui = v;
         s_vol_idle = 0;
-        lv_obj_move_foreground(s_vol_cont);
-        lv_obj_clear_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
         lv_bar_set_value(s_vol_bar, v, LV_ANIM_OFF);
         lv_label_set_text_fmt(s_vol_val, "%" PRId32, v);
+        if (s_vol_state == VOL_STATE_HIDDEN) {
+            vol_popup_slide_in();
+        } else if (s_vol_state == VOL_STATE_HIDING) {
+            vol_popup_slide_in();   /* 滑出中被调回, 重新滑入 */
+        }
+        /* SHOWING 状态: 已显示, 仅刷新数值 */
     } else {
         s_vol_idle++;
-        if (s_vol_idle >= VOL_POP_HIDE_MS / 200) {
-            lv_obj_add_flag(s_vol_cont, LV_OBJ_FLAG_HIDDEN);
+        if (s_vol_state == VOL_STATE_SHOWING &&
+            s_vol_idle >= VOL_POP_HIDE_MS / 200) {
+            vol_popup_slide_out();
         }
     }
 
     volume_save_to_nvs();
 }
 
-static void create_ui(void)
+/* 音量按键轮询 (10ms): 高电平触发增减, 两次触发间隔不小于100ms
+ * 之前放在 sys_monitor(10Hz) 会漏掉 <100ms 的短按, 移入 LVGL 用 10ms 轮询 */
+static void vol_key_poll_cb(lv_timer_t *timer)
 {
+    static int64_t s_vol_key_last_us = 0;
+
+    int64_t now = esp_timer_get_time();
+    if ((now - s_vol_key_last_us) < VOL_KEY_MIN_MS * 1000LL) {
+        return;   /* 防连发 */
+    }
+
+    if (gpio_get_level(PIN_VOL_UP) == 1) {
+        volume_inc(VOLUME_STEP);
+        s_vol_key_last_us = now;
+    } else if (gpio_get_level(PIN_VOL_DOWN) == 1) {
+        volume_inc(-VOLUME_STEP);
+        s_vol_key_last_us = now;
+    }
+}
+
+static void vol_key_init(void)
+{
+    gpio_set_direction(PIN_VOL_UP, GPIO_MODE_INPUT);
+    gpio_set_direction(PIN_VOL_DOWN, GPIO_MODE_INPUT);
+    lv_timer_create(vol_key_poll_cb, VOL_KEY_POLL_MS, NULL);
+}
+
+/* ── 主界面构建 ── */
+void ui_player_init(void)
+{
+    play_mode_t m;
+    if (settings_mode_load(&m)) s_play_mode = m;
+
     lv_obj_t *scr = lv_scr_act();
 
     /* ── 屏幕底色 ── */
     lv_obj_set_style_bg_color(scr, COLOR_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    /* 关闭屏幕自身滚动条: 弹窗滑到屏外会撑大屏幕内容触发, 文件浏览器滚动条在各自 list 内部不受影响 */
+    lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     /* ── TOP BAR ── */
     /* 菜单按钮 */
@@ -682,7 +699,6 @@ static void create_ui(void)
     lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_status_label, COLOR_MUTED, 0);
     lv_label_set_text(s_status_label, "PLAYER");
-
 
     /* 专辑封面区域 */
     s_album_art = lv_obj_create(scr);
@@ -730,7 +746,7 @@ static void create_ui(void)
     lv_obj_set_pos(s_title_label, 8, 148);
     lv_obj_set_size(s_title_label, 156, 20);
     lv_obj_set_style_text_align(s_title_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s_title_label, &chinese_16, 0);
+    lv_obj_set_style_text_font(s_title_label, &lv_font_global_16, 0);
     lv_obj_set_style_text_color(s_title_label, COLOR_FG, 0);
     lv_label_set_long_mode(s_title_label, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_title_label, "标题");
@@ -739,7 +755,7 @@ static void create_ui(void)
     lv_obj_set_pos(s_artist_label, 8, 170);
     lv_obj_set_size(s_artist_label, 156, 16);
     lv_obj_set_style_text_align(s_artist_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s_artist_label, &chinese_16, 0);
+    lv_obj_set_style_text_font(s_artist_label, &lv_font_global_16, 0);
     lv_obj_set_style_text_color(s_artist_label, COLOR_MUTED, 0);
     lv_label_set_long_mode(s_artist_label, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_artist_label, "作者");
@@ -781,7 +797,7 @@ static void create_ui(void)
     lv_obj_set_style_text_color(s_time_total, COLOR_MUTED, 0);
     lv_label_set_text(s_time_total, "0:00");
 
-    /* ── 播放控制按钮�?── */
+    /* ── 播放控制按钮 ── */
     /* 播放 / 暂停 */
     lv_obj_t *play_btn = lv_btn_create(scr);
     lv_obj_set_pos(play_btn, 63, 212);
@@ -801,7 +817,7 @@ static void create_ui(void)
     lv_obj_center(s_play_icon);
     lv_obj_add_event_cb(play_btn, play_btn_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 上一�?*/
+    /* 上一首 */
     lv_obj_t *prev_btn = lv_btn_create(scr);
     lv_obj_set_pos(prev_btn, 25, 220);
     lv_obj_set_size(prev_btn, 36, 36);
@@ -818,8 +834,7 @@ static void create_ui(void)
     lv_obj_center(prev_icon);
     lv_obj_add_event_cb(prev_btn, player_prev_click_cb, LV_EVENT_CLICKED, NULL);
 
-
-    /* 下一�?*/
+    /* 下一首 */
     lv_obj_t *next_btn = lv_btn_create(scr);
     lv_obj_set_pos(next_btn, 111, 220);
     lv_obj_set_size(next_btn, 36, 36);
@@ -865,7 +880,7 @@ static void create_ui(void)
     mode_update_icon();
     lv_obj_add_event_cb(mode_btn, mode_btn_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* ── 技术参数信�?(右侧三列) ── */
+    /* ── 技术参数信息 (右侧三列) ── */
     /* 格式 */
     s_fmt_val = lv_label_create(panel);
     lv_obj_set_pos(s_fmt_val, 52, 14);
@@ -873,16 +888,14 @@ static void create_ui(void)
     lv_obj_set_style_text_color(s_fmt_val, COLOR_ACCENT, 0);
     lv_label_set_text(s_fmt_val, "");
 
-    /* 采样�?*/
-
+    /* 采样率 */
     s_sr_val = lv_label_create(panel);
     lv_obj_set_pos(s_sr_val, 92, 14);
     lv_obj_set_style_text_font(s_sr_val, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_sr_val, COLOR_FG, 0);
     lv_label_set_text(s_sr_val, "");
 
-    /* 位深�?*/
-
+    /* 位深 */
     s_bd_val = lv_label_create(panel);
     lv_obj_set_pos(s_bd_val, 128, 14);
     lv_obj_set_style_text_font(s_bd_val, &lv_font_montserrat_14, 0);
@@ -892,213 +905,7 @@ static void create_ui(void)
     lv_timer_create(fs_sd_monitor_cb, 50, NULL);
     lv_timer_create(song_info_monitor_cb, 500, NULL);
     lv_timer_create(volume_monitor_cb, 200, NULL);
+    vol_key_init();
 
     vol_popup_create();
-}
-
-static void lvgl_task(void *arg)
-{
-    lv_init();
-
-    s_panel = lcd_init(SPI2_HOST);
-    touch_init();
-
-    lv_disp_draw_buf_init(&s_draw_buf_dsc, s_draw_buf1, s_draw_buf2, LVGL_BUF_SIZE);
-    lv_disp_drv_init(&s_disp_drv);
-    s_disp_drv.hor_res  = TFT_HOR_RES;
-    s_disp_drv.ver_res  = TFT_VER_RES;
-    s_disp_drv.flush_cb = my_disp_flush;
-    s_disp_drv.draw_buf = &s_draw_buf_dsc;
-    lv_disp_drv_register(&s_disp_drv);
-
-    lv_indev_drv_t indev_drv;
-    lv_indev_drv_init(&indev_drv);
-    indev_drv.type    = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = touch_read_cb;
-    lv_indev_drv_register(&indev_drv);
-
-    create_ui();
-
-    bt_list_init(s_bt_iface);
-
-    fs_list_set_play_cb(player_play_file);
-
-    s_queue_set = xQueueCreateSet(3);
-    xQueueAddToSet(s_app_cmd_queue,  s_queue_set);
-    xQueueAddToSet(s_bt_iface->evt_queue, s_queue_set);
-    xQueueAddToSet(s_audio_rsp_queue, s_queue_set);
-
-    ESP_LOGI(LVGL_TAG, "UI ready");
-
-    app_cmd_t   app_cmd;
-    bt_evt_t    bt_evt;
-    audio_rsp_t audio_rsp;
-    audio_cmd_t audio_cmd;
-    bt_cmd_t    bt_cmd;
-
-    while (1) {
-        lv_timer_handler();
-
-        QueueHandle_t active = xQueueSelectFromSet(s_queue_set, 0);
-
-        if (active == s_app_cmd_queue) {
-            while (xQueueReceive(s_app_cmd_queue, &app_cmd, 0) == pdTRUE) {
-                switch (app_cmd.type) {
-                case APP_CMD_BT_SCAN:
-                    memset(&bt_cmd, 0, sizeof(bt_cmd));
-                    bt_cmd.type = BT_CMD_SCAN;
-                    xQueueSend(s_bt_iface->cmd_queue, &bt_cmd, 0);
-                    printf("[LVGL] scan\n");
-                    break;
-
-                case APP_CMD_BT_CONNECT:
-                    if (bt_a2dp_is_connected()) {
-                        printf("[LVGL] already connected\n");
-                    } else {
-                        memset(&bt_cmd, 0, sizeof(bt_cmd));
-                        bt_cmd.type = BT_CMD_CONNECT;
-                        strncpy(bt_cmd.device_name, app_cmd.param,
-                                sizeof(bt_cmd.device_name) - 1);
-                        xQueueSend(s_bt_iface->cmd_queue, &bt_cmd, 0);
-                        printf("[LVGL] connecting: %s\n", app_cmd.param);
-                    }
-                    break;
-
-                case APP_CMD_BT_DISCONNECT:
-                    memset(&bt_cmd, 0, sizeof(bt_cmd));
-                    bt_cmd.type = BT_CMD_DISCONNECT;
-                    xQueueSend(s_bt_iface->cmd_queue, &bt_cmd, 0);
-                    printf("[LVGL] disconnecting\n");
-                    break;
-
-                case APP_CMD_PLAY:
-                    if (bt_a2dp_is_connected()) {
-                        struct stat st;
-                        if (!sdmmc_disk_is_mounted()) {
-                            printf("[LVGL] SD not mounted\n");
-                        } else if (stat("/sdcard/a.mp3", &st) != 0) {
-                            printf("[LVGL] /sdcard/a.mp3 not found\n");
-                        } else {
-                            audio_cmd.type = AUDIO_CMD_PLAY;
-                            strcpy(audio_cmd.path, "/sdcard/a.mp3");
-                            xQueueSend(s_audio_cmd_queue, &audio_cmd, 0);
-                            s_was_playing = true;
-                            printf("[LVGL] PLAY sent | ts=%lld us\n", esp_timer_get_time());
-                        }
-                    } else {
-                        printf("[LVGL] not connected, can't play\n");
-                    }
-                    break;
-
-                case APP_CMD_STOP:
-                    audio_cmd.type = AUDIO_CMD_STOP;
-                    xQueueSend(s_audio_cmd_queue, &audio_cmd, 0);
-                    s_was_playing = false;
-                    break;
-
-                case APP_CMD_PAUSE:
-                    audio_cmd.type = AUDIO_CMD_PAUSE;
-                    xQueueSend(s_audio_cmd_queue, &audio_cmd, 0);
-                    break;
-
-                case APP_CMD_INFO:
-                    printf("[info] connected: %s | playing: %s\n",
-                           bt_a2dp_is_connected() ? "yes" : "no",
-                           s_was_playing ? "yes" : "no");
-                    break;
-
-                case APP_CMD_COVER_READY: {
-                    void *buf;
-                    memcpy(&buf, app_cmd.param, sizeof(buf));
-                    cover_show(buf);
-                    break;
-                }
-                }
-            }
-        }
-
-        if (active == s_bt_iface->evt_queue) {
-            while (xQueueReceive(s_bt_iface->evt_queue, &bt_evt, 0) == pdTRUE) {
-                switch (bt_evt.type) {
-                case BT_EVT_DEVICE_FOUND:
-                    bt_list_on_device_found(bt_evt.device_name);
-                    break;
-                case BT_EVT_SCAN_DONE:
-                    bt_list_on_scan_done();
-                    break;
-                case BT_EVT_CONNECTED:
-                    audio_cmd.type = AUDIO_CMD_BT_CONNECTED;
-                    xQueueSend(s_audio_cmd_queue, &audio_cmd, 0);
-                    bt_list_on_connected(bt_evt.device_name);
-                    if (s_was_playing) {
-                        printf("[LVGL] BT resume, notify audio\n");
-                    }
-                    break;
-                case BT_EVT_CONNECT_FAILED:
-                    bt_list_on_connect_failed(bt_evt.device_name);
-                    break;
-                case BT_EVT_DISCONNECTED:
-                    audio_cmd.type = AUDIO_CMD_BT_DISCONNECTED;
-                    xQueueSend(s_audio_cmd_queue, &audio_cmd, 0);
-                    bt_list_on_disconnected();
-                    break;
-                case BT_EVT_STREAM_READY:
-                    printf("[stream ready]\n");
-                    break;
-                case BT_EVT_STREAM_STOPPED:
-                    printf("[stream stopped]\n");
-                    break;
-                case BT_EVT_STATE_RSP:
-                    bt_list_on_state_rsp(bt_evt.state, bt_evt.device_name);
-                    break;
-                }
-            }
-        }
-
-        if (active == s_audio_rsp_queue) {
-            while (xQueueReceive(s_audio_rsp_queue, &audio_rsp, 0) == pdTRUE) {
-                switch (audio_rsp.type) {
-                case AUDIO_RSP_BT_CHECK:
-                    if (bt_a2dp_is_connected()) {
-                        audio_cmd.type = AUDIO_CMD_BT_CONNECTED;
-                    } else {
-                        audio_cmd.type = AUDIO_CMD_BT_DISCONNECTED;
-                    }
-                    xQueueSend(s_audio_cmd_queue, &audio_cmd, 0);
-                    break;
-                case AUDIO_RSP_FILE_NOT_FOUND:
-                    if (s_auto_advancing) {
-                        player_advance();
-                    } else {
-                        show_file_not_found();
-                    }
-                    break;
-                case AUDIO_RSP_SONG_FINISHED:
-                    s_auto_advancing = true;
-                    player_advance();
-                    break;
-                }
-            }
-        }
-
-        /* 忙跑策略: 不依赖 lv_timer 返回值 sleep, 每 1 秒让出 10ms
-         * 喂 Task WDT + 让同核 (sys_serial/sys_monitor/idle) 任务运行 */
-        //if (esp_timer_get_time() - s_last_yield_us >= LVGL_YIELD_PERIOD_US) {
-            vTaskDelay(pdMS_TO_TICKS(2));
-            //s_last_yield_us = esp_timer_get_time();
-        //}
-    }
-}
-
-void lvgl_task_init(const lvgl_task_params_t *params)
-{
-    s_app_cmd_queue  = params->app_cmd_queue;
-    s_bt_iface       = params->bt_iface;
-    s_audio_cmd_queue = params->audio_cmd_queue;
-    s_audio_rsp_queue = params->audio_rsp_queue;
-
-    volume_load_from_nvs();
-    mode_load_from_nvs();
-
-    xTaskCreatePinnedToCore(lvgl_task, "lvgl", 8192, NULL, 1, NULL, 1);
 }

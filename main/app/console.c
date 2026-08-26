@@ -9,7 +9,7 @@
 #include "freertos/timers.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
-#include "sys_serial.h"
+#include "app.h"
 #include "sys_monitor.h"
 
 #define SERIAL_TAG    "SYS_SERIAL"
@@ -118,7 +118,7 @@ static void cmd_psram(void)
            total / 1024, largest / 1024);
 }
 
-static void sys_serial_task(void *arg)
+static void console_task(void *arg)
 {
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
@@ -192,7 +192,7 @@ static void sys_serial_task(void *arg)
     }
 }
 
-void sys_serial_init(QueueHandle_t app_cmd_queue)
+void console_init(QueueHandle_t app_cmd_queue)
 {
     s_app_cmd_queue = app_cmd_queue;
 
@@ -200,5 +200,5 @@ void sys_serial_init(QueueHandle_t app_cmd_queue)
                                        pdTRUE, NULL, stats_timer_cb);
     xTimerStart(timer, 0);
 
-    xTaskCreatePinnedToCore(sys_serial_task, "sys_serial", 2048, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(console_task, "sys_serial", 2048, NULL, 1, NULL, 1);
 }
