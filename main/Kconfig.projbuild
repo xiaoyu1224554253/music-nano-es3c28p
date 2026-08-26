@@ -1,0 +1,21 @@
+menu "A2DP Example Configuration"
+    config EXAMPLE_SSP_ENABLED
+        bool "Secure Simple Pairing"
+        depends on BT_CLASSIC_ENABLED
+        default n
+        help
+            This enables the Secure Simple Pairing. If disable this option,
+            Bluedroid will only support Legacy Pairing
+
+    config EXAMPLE_PEER_DEVICE_NAME
+        string "Target Device Name"
+        default "TWS"
+        help
+            Use this option to set target device name to connect.
+
+    config RUNTIME_MONITOR_ENABLE
+        bool "启用运行时 CPU/内存监控"
+        default y
+        help
+            每 5 秒在串口打印空闲内存和 CPU 空闲率。
+endmenu
