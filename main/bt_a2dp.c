@@ -14,6 +14,8 @@
 #include "esp_avrc_api.h"
 #include "esp_timer.h"
 #include "bt_a2dp.h"
+#include "audio_task.h"
+#include "atomic_utils.h"
 
 #define BT_TAG              "BT_A2DP"
 #define RC_TAG              "BT_RC"
@@ -40,11 +42,23 @@ static SemaphoreHandle_t s_init_sem = NULL;
 static bool s_bt_ready = false;
 static bool s_connected = false;
 static bool s_scanning = false;
+static bool s_connecting = false;
+static bool s_sleeping = false;
+static bool s_stream_started = false;
 static esp_bd_addr_t s_peer_bda;
 
 static uint8_t s_cache_count = 0;
 static esp_bd_addr_t s_cache_bda[CACHE_MAX];
 static char s_cache_name[CACHE_MAX][32];
+
+static char        s_connect_target[32];
+static int         s_connect_retry;
+static bool        s_connect_found;
+static bool        s_pending_connect_scan = false;
+static esp_bd_addr_t s_connect_bda;
+
+static char        s_connecting_name[32];
+static char        s_connected_name[32];
 
 static esp_avrc_rn_evt_cap_mask_t s_avrc_peer_rn_cap;
 
@@ -115,14 +129,6 @@ static void send_evt(bt_evt_type_t type, const char *name, int error)
         strncpy(evt.device_name, name, sizeof(evt.device_name) - 1);
     }
     xQueueSend(s_iface.evt_queue, &evt, 0);
-}
-
-static bool lookup_addr(const char *device_name, esp_bd_addr_t bda_out)
-{
-    int idx = cache_find(device_name);
-    if (idx < 0) return false;
-    memcpy(bda_out, s_cache_bda[idx], ESP_BD_ADDR_LEN);
-    return true;
 }
 
 static bool bt_a2dp_send_dispatch(bt_dispatch_type_t type, uint16_t event, void *param, size_t param_len)
@@ -261,11 +267,20 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
     case ESP_A2D_CONNECTION_STATE_EVT: {
         if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             s_connected = true;
+            s_connecting = false;
+            s_stream_started = false;
+            strncpy(s_connected_name, s_connecting_name,
+                    sizeof(s_connected_name) - 1);
+            s_connected_name[sizeof(s_connected_name) - 1] = '\0';
+            memset(s_connecting_name, 0, sizeof(s_connecting_name));
             ESP_LOGI(BT_TAG, "A2DP 已连接");
-            send_evt(BT_EVT_CONNECTED, NULL, 0);
-            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+            send_evt(BT_EVT_CONNECTED, s_connected_name, 0);
         } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             s_connected = false;
+            s_connecting = false;
+            s_stream_started = false;
+            memset(s_connected_name, 0, sizeof(s_connected_name));
+            memset(s_connecting_name, 0, sizeof(s_connecting_name));
             ESP_LOGI(BT_TAG, "A2DP 已断开连接");
             send_evt(BT_EVT_DISCONNECTED, NULL, 0);
             send_evt(BT_EVT_STREAM_STOPPED, NULL, 0);
@@ -273,15 +288,14 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
         break;
     }
     case ESP_A2D_MEDIA_CTRL_ACK_EVT: {
-        if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY &&
+        if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
             a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
-            ESP_LOGI(BT_TAG, "A2DP 媒体就绪, 启动流媒体");
-            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
-        } else if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
-                   a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
             ESP_LOGI(BT_TAG, "A2DP 流媒体已启动");
-            printf("[BT_EVT] STREAM_START 时间戳=%lld us\n", esp_timer_get_time());
             send_evt(BT_EVT_STREAM_READY, NULL, 0);
+        } else if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_SUSPEND &&
+                   a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+            ESP_LOGI(BT_TAG, "A2DP 流媒体已挂起");
+            send_evt(BT_EVT_STREAM_STOPPED, NULL, 0);
         }
         break;
     }
@@ -333,8 +347,16 @@ static void bt_a2dp_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p
             bda2str(param->disc_res.bda, bda_str, sizeof(bda_str));
             ESP_LOGI(BT_TAG, "扫描到设备: %s, 名称 %s", bda_str, device_name);
 
-            if (cache_add(param->disc_res.bda, device_name)) {
-                send_evt(BT_EVT_DEVICE_FOUND, device_name, 0);
+            if (s_connect_target[0] != '\0') {
+                if (strcmp(device_name, s_connect_target) == 0) {
+                    s_connect_found = true;
+                    memcpy(s_connect_bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
+                    esp_bt_gap_cancel_discovery();
+                }
+            } else {
+                if (cache_add(param->disc_res.bda, device_name)) {
+                    send_evt(BT_EVT_DEVICE_FOUND, device_name, 0);
+                }
             }
         }
         break;
@@ -342,8 +364,37 @@ static void bt_a2dp_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
         if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
             s_scanning = false;
-            ESP_LOGI(BT_TAG, "设备搜索已停止。");
-            send_evt(BT_EVT_SCAN_DONE, NULL, 0);
+
+            if (s_connect_target[0] != '\0') {
+                if (s_connect_found) {
+                    ESP_LOGI(BT_TAG, "找到目标设备 %s，开始连接", s_connect_target);
+                    memcpy(s_peer_bda, s_connect_bda, ESP_BD_ADDR_LEN);
+                    esp_a2d_source_connect(s_peer_bda);
+                    memset(s_connect_target, 0, sizeof(s_connect_target));
+                } else if (s_pending_connect_scan) {
+                    s_pending_connect_scan = false;
+                    ESP_LOGI(BT_TAG, "空闲扫描已取消，开始连接扫描: %s", s_connect_target);
+                    s_scanning = true;
+                    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,
+                                               1, 0);
+                } else if (s_connect_retry < 2) {
+                    s_connect_retry++;
+                    ESP_LOGI(BT_TAG, "未找到设备 %s，第 %d 次重试",
+                             s_connect_target, s_connect_retry);
+                    s_scanning = true;
+                    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY,
+                                               3, 0);
+                } else {
+                    ESP_LOGW(BT_TAG, "未找到设备 %s，连接失败", s_connect_target);
+                    s_connecting = false;
+                    memset(s_connecting_name, 0, sizeof(s_connecting_name));
+                    send_evt(BT_EVT_CONNECT_FAILED, s_connect_target, -1);
+                    memset(s_connect_target, 0, sizeof(s_connect_target));
+                }
+            } else {
+                ESP_LOGI(BT_TAG, "设备搜索已停止。");
+                send_evt(BT_EVT_SCAN_DONE, NULL, 0);
+            }
         } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
             s_scanning = true;
             ESP_LOGI(BT_TAG, "设备搜索已开始。");
@@ -486,7 +537,43 @@ static void bt_a2dp_task(void *arg)
     QueueHandle_t     active;
 
     while (1) {
-        active = xQueueSelectFromSet(s_queue_set, portMAX_DELAY);
+        bool busy = s_scanning || s_connecting || s_connected;
+
+        if (s_connected) {
+            if (s_sleeping) {
+                esp_bt_sleep_disable();
+                s_sleeping = false;
+            }
+            active = xQueueSelectFromSet(s_queue_set, pdMS_TO_TICKS(200));
+            if (active == NULL) {
+                bool want = atomic_load_bool(&g_pcm_active);
+                if (want != s_stream_started) {
+                    esp_a2d_media_ctrl(want ? ESP_A2D_MEDIA_CTRL_START
+                                            : ESP_A2D_MEDIA_CTRL_SUSPEND);
+                    s_stream_started = want;
+                }
+                continue;
+            }
+        } else if (busy) {
+            if (s_sleeping) {
+                esp_bt_sleep_disable();
+                s_sleeping = false;
+            }
+            active = xQueueSelectFromSet(s_queue_set, portMAX_DELAY);
+        } else {
+            if (s_sleeping) {
+                esp_bt_sleep_disable();
+                s_sleeping = false;
+            }
+            active = xQueueSelectFromSet(s_queue_set, pdMS_TO_TICKS(1000));
+            if (active == NULL) {
+                esp_bt_sleep_enable();
+                s_sleeping = true;
+                active = xQueueSelectFromSet(s_queue_set, portMAX_DELAY);
+                esp_bt_sleep_disable();
+                s_sleeping = false;
+            }
+        }
 
         if (active == s_iface.cmd_queue) {
             xQueueReceive(s_iface.cmd_queue, &cmd, 0);
@@ -501,6 +588,10 @@ static void bt_a2dp_task(void *arg)
                     ESP_LOGW(BT_TAG, "正在扫描中，忽略重复扫描命令");
                     break;
                 }
+                if (s_connect_target[0] != '\0') {
+                    ESP_LOGW(BT_TAG, "正在进行连接扫描，忽略扫描命令");
+                    break;
+                }
                 ESP_LOGI(BT_TAG, "开始设备搜索...");
                 s_cache_count = 0;
                 memset(s_cache_bda, 0, sizeof(s_cache_bda));
@@ -509,20 +600,49 @@ static void bt_a2dp_task(void *arg)
                 esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 3, 0);
                 break;
             }
+            case BT_CMD_STOP_SCAN: {
+                if (!s_scanning) {
+                    ESP_LOGW(BT_TAG, "未在扫描中，忽略终止扫描命令");
+                    break;
+                }
+                ESP_LOGI(BT_TAG, "终止扫描...");
+                if (s_connect_target[0] != '\0') {
+                    memset(s_connect_target, 0, sizeof(s_connect_target));
+                    s_pending_connect_scan = false;
+                    s_connecting = false;
+                    memset(s_connecting_name, 0, sizeof(s_connecting_name));
+                    send_evt(BT_EVT_CONNECT_FAILED, NULL, -1);
+                }
+                esp_bt_gap_cancel_discovery();
+                break;
+            }
             case BT_CMD_CONNECT: {
                 if (s_connected) {
                     ESP_LOGW(BT_TAG, "已连接设备，忽略连接命令");
                     break;
                 }
-                esp_bd_addr_t bda;
-                if (!lookup_addr(cmd.device_name, bda)) {
-                    ESP_LOGW(BT_TAG, "未在缓存中找到设备: %s", cmd.device_name);
-                    send_evt(BT_EVT_CONNECT_FAILED, cmd.device_name, -1);
+                if (s_connect_target[0] != '\0') {
+                    ESP_LOGW(BT_TAG, "正在连接中，忽略重复连接命令");
                     break;
                 }
-                ESP_LOGI(BT_TAG, "正在连接设备: %s", cmd.device_name);
-                memcpy(s_peer_bda, bda, ESP_BD_ADDR_LEN);
-                esp_a2d_source_connect(s_peer_bda);
+                ESP_LOGI(BT_TAG, "开始搜索并连接: %s", cmd.device_name);
+                strncpy(s_connect_target, cmd.device_name,
+                        sizeof(s_connect_target) - 1);
+                s_connect_target[sizeof(s_connect_target) - 1] = '\0';
+                strncpy(s_connecting_name, cmd.device_name,
+                        sizeof(s_connecting_name) - 1);
+                s_connecting_name[sizeof(s_connecting_name) - 1] = '\0';
+                s_connect_retry = 0;
+                s_connect_found = false;
+                s_connecting = true;
+
+                if (s_scanning) {
+                    s_pending_connect_scan = true;
+                    esp_bt_gap_cancel_discovery();
+                } else {
+                    s_scanning = true;
+                    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 1, 0);
+                }
                 break;
             }
             case BT_CMD_DISCONNECT: {
@@ -532,6 +652,24 @@ static void bt_a2dp_task(void *arg)
                 }
                 ESP_LOGI(BT_TAG, "正在断开连接...");
                 esp_a2d_source_disconnect(s_peer_bda);
+                break;
+            }
+            case BT_CMD_GET_STATE: {
+                bt_evt_t evt;
+                memset(&evt, 0, sizeof(evt));
+                evt.type = BT_EVT_STATE_RSP;
+                if (s_connected) {
+                    evt.state = BT_STATE_CONNECTED;
+                    strncpy(evt.device_name, s_connected_name,
+                            sizeof(evt.device_name) - 1);
+                } else if (s_connecting) {
+                    evt.state = BT_STATE_CONNECTING;
+                    strncpy(evt.device_name, s_connecting_name,
+                            sizeof(evt.device_name) - 1);
+                } else {
+                    evt.state = BT_STATE_DISCONNECTED;
+                }
+                xQueueSend(s_iface.evt_queue, &evt, 0);
                 break;
             }
             default:
@@ -579,6 +717,14 @@ bt_a2dp_iface_t *bt_a2dp_init(void)
     vSemaphoreDelete(s_init_sem);
     s_init_sem = NULL;
     return &s_iface;
+}
+
+bt_state_t bt_a2dp_get_state(void)
+{
+    if (!s_bt_ready) return BT_STATE_DISCONNECTED;
+    if (s_connected) return BT_STATE_CONNECTED;
+    if (s_connecting) return BT_STATE_CONNECTING;
+    return BT_STATE_DISCONNECTED;
 }
 
 bool bt_a2dp_is_connected(void)

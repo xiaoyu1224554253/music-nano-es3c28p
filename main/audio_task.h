@@ -1,6 +1,7 @@
 #ifndef __AUDIO_TASK_H__
 #define __AUDIO_TASK_H__
 
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/stream_buffer.h"
@@ -8,6 +9,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+extern volatile bool g_pcm_active;
 
 typedef enum {
     AUDIO_CMD_PLAY            = 0,

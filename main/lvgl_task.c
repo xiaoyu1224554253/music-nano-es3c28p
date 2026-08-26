@@ -149,6 +149,7 @@ static void create_ui(void)
     lv_obj_t *btn_ble = make_icon_btn(scr, 126, 5, 40, 40, LV_SYMBOL_BLUETOOTH);
     lv_obj_t *icon_ble = lv_obj_get_child(btn_ble, 0);
     lv_obj_set_style_text_font(icon_ble, &lv_font_montserrat_20, 0);
+    lv_obj_add_event_cb(btn_ble, bt_menu_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* 文字 */
     s_status_label = lv_label_create(scr);
@@ -358,6 +359,8 @@ static void lvgl_task(void *arg)
 
     create_ui();
 
+    bt_list_init(s_bt_iface);
+
     s_queue_set = xQueueCreateSet(3);
     xQueueAddToSet(s_app_cmd_queue,  s_queue_set);
     xQueueAddToSet(s_bt_iface->evt_queue, s_queue_set);
@@ -449,32 +452,35 @@ static void lvgl_task(void *arg)
             while (xQueueReceive(s_bt_iface->evt_queue, &bt_evt, 0) == pdTRUE) {
                 switch (bt_evt.type) {
                 case BT_EVT_DEVICE_FOUND:
-                    printf("[found] %s\n", bt_evt.device_name);
+                    bt_list_on_device_found(bt_evt.device_name);
                     break;
                 case BT_EVT_SCAN_DONE:
-                    printf("[scan done]\n");
+                    bt_list_on_scan_done();
                     break;
                 case BT_EVT_CONNECTED:
-                    printf("[connected]\n");
                     audio_cmd.type = AUDIO_CMD_BT_CONNECTED;
                     xQueueSend(s_audio_cmd_queue, &audio_cmd, 0);
+                    bt_list_on_connected(bt_evt.device_name);
                     if (s_was_playing) {
                         printf("[LVGL] BT resume, notify audio\n");
                     }
                     break;
                 case BT_EVT_CONNECT_FAILED:
-                    printf("[connect failed] %s\n", bt_evt.device_name);
+                    bt_list_on_connect_failed(bt_evt.device_name);
                     break;
                 case BT_EVT_DISCONNECTED:
-                    printf("[disconnected]\n");
                     audio_cmd.type = AUDIO_CMD_BT_DISCONNECTED;
                     xQueueSend(s_audio_cmd_queue, &audio_cmd, 0);
+                    bt_list_on_disconnected();
                     break;
                 case BT_EVT_STREAM_READY:
                     printf("[stream ready]\n");
                     break;
                 case BT_EVT_STREAM_STOPPED:
                     printf("[stream stopped]\n");
+                    break;
+                case BT_EVT_STATE_RSP:
+                    bt_list_on_state_rsp(bt_evt.state, bt_evt.device_name);
                     break;
                 }
             }

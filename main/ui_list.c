@@ -194,24 +194,21 @@ static void fs_back_click_cb(lv_event_t *e)
 {
     fs_browser_go_back();
 }
-
 static void fs_browser_open(void)
 {
     if (s_fs_overlay) {
         fs_browser_close();
     }
-
-    s_fs_icon_dir.header.w   = 16;
-    s_fs_icon_dir.header.h   = 21;
-    s_fs_icon_dir.data_size  = 16 * 21 * 2;
-    s_fs_icon_dir.header.cf  = LV_IMG_CF_TRUE_COLOR;
-    s_fs_icon_dir.data       = (const uint8_t *)file[0];
-
-    s_fs_icon_music.header.w   = 16;
-    s_fs_icon_music.header.h   = 21;
-    s_fs_icon_music.data_size  = 16 * 21 * 2;
-    s_fs_icon_music.header.cf  = LV_IMG_CF_TRUE_COLOR;
-    s_fs_icon_music.data       = (const uint8_t *)file[1];
+    s_fs_icon_dir.header.w = 16;
+    s_fs_icon_dir.header.h = 21;
+    s_fs_icon_dir.data_size = 16 * 21 * 2;
+    s_fs_icon_dir.header.cf = LV_IMG_CF_TRUE_COLOR;
+    s_fs_icon_dir.data = (const uint8_t *)file[0];
+    s_fs_icon_music.header.w = 16;
+    s_fs_icon_music.header.h = 21;
+    s_fs_icon_music.data_size = 16 * 21 * 2;
+    s_fs_icon_music.header.cf = LV_IMG_CF_TRUE_COLOR;
+    s_fs_icon_music.data = (const uint8_t *)file[1];
 
     s_fs_overlay = lv_btn_create(lv_scr_act());
     lv_obj_set_size(s_fs_overlay, 172, 320);
@@ -250,7 +247,6 @@ static void fs_browser_open(void)
     lv_obj_set_style_border_width(back_btn, 0, 0);
     lv_obj_set_style_shadow_width(back_btn, 0, 0);
     lv_obj_add_event_cb(back_btn, fs_back_click_cb, LV_EVENT_CLICKED, NULL);
-
     lv_obj_t *back_lbl = lv_label_create(back_btn);
     lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
@@ -259,57 +255,68 @@ static void fs_browser_open(void)
 
     s_fs_list = lv_list_create(s_fs_cont);
     lv_obj_set_pos(s_fs_list, 0, 18);
-    lv_obj_set_size(s_fs_list, FS_W, FS_H - 36);
+    /* 修改列表高度：原为 FS_H - 36，现减少高度以为大按钮腾出空间 */
+    /* 假设底部导航区高度设为 40 (原18)，则列表高度 = FS_H(220) - 18(标题) - 40(底部) = 162 */
+    lv_obj_set_size(s_fs_list, FS_W, FS_H - 54); 
     lv_obj_set_style_bg_color(s_fs_list, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(s_fs_list, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_fs_list, 0, 0);
     lv_obj_set_style_pad_all(s_fs_list, 0, 0);
 
-    int nav_y = FS_H - 18;
+    /* 修改导航区域 Y 坐标，向上移动 */
+    int nav_y = FS_H - 35; 
 
     s_fs_prev_btn = lv_btn_create(s_fs_cont);
     lv_obj_set_pos(s_fs_prev_btn, 2, nav_y);
-    lv_obj_set_size(s_fs_prev_btn, 30, 16);
-    lv_obj_set_style_radius(s_fs_prev_btn, 3, 0);
-    lv_obj_set_style_bg_color(s_fs_prev_btn, lv_color_white(), 0);
+    /* 修改按钮大小：变大变高 (40x32) */
+    lv_obj_set_size(s_fs_prev_btn, 40, 32); 
+    lv_obj_set_style_radius(s_fs_prev_btn, 6, 0);
+    /* 修改按钮颜色：变为浅灰色，更深 */
+    lv_obj_set_style_bg_color(s_fs_prev_btn, lv_color_hex(0xE0E0E0), 0);
     lv_obj_set_style_bg_opa(s_fs_prev_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_fs_prev_btn, 0, 0);
     lv_obj_set_style_shadow_width(s_fs_prev_btn, 0, 0);
     lv_obj_add_event_cb(s_fs_prev_btn, fs_prev_click_cb, LV_EVENT_CLICKED, NULL);
-
+    
     lv_obj_t *prev_lbl = lv_label_create(s_fs_prev_btn);
     lv_label_set_text(prev_lbl, "<");
     lv_obj_set_style_text_font(prev_lbl, &chinese_16, 0);
+    /* 文字颜色也设为蓝色，更协调 */
     lv_obj_set_style_text_color(prev_lbl, lv_color_hex(0x0000FF), 0);
     lv_obj_center(prev_lbl);
 
     s_fs_page_lbl = lv_label_create(s_fs_cont);
-    lv_obj_set_pos(s_fs_page_lbl, 38, nav_y - 2);
-    lv_obj_set_size(s_fs_page_lbl, 54, 14);
+    /* 调整页码标签位置，使其在新的空间内居中 */
+    /* 按钮宽40，总宽135。间隙约 (135-40-40)/3 = 18.3 */
+    lv_obj_set_pos(s_fs_page_lbl, 47, nav_y + 8); 
+    lv_obj_set_size(s_fs_page_lbl, 40, 16); /* 稍微变窄以适应新布局 */
     lv_obj_set_style_text_align(s_fs_page_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(s_fs_page_lbl, &chinese_16, 0);
     lv_obj_set_style_text_color(s_fs_page_lbl, lv_color_black(), 0);
     lv_label_set_text(s_fs_page_lbl, "1/1");
 
     s_fs_next_btn = lv_btn_create(s_fs_cont);
-    lv_obj_set_pos(s_fs_next_btn, FS_W - 32, nav_y);
-    lv_obj_set_size(s_fs_next_btn, 30, 16);
-    lv_obj_set_style_radius(s_fs_next_btn, 3, 0);
-    lv_obj_set_style_bg_color(s_fs_next_btn, lv_color_white(), 0);
+    /* 调整 X 坐标，靠右对齐 */
+    lv_obj_set_pos(s_fs_next_btn, FS_W - 42, nav_y); 
+    /* 修改按钮大小：变大变高 (40x32) */
+    lv_obj_set_size(s_fs_next_btn, 40, 32);
+    lv_obj_set_style_radius(s_fs_next_btn, 6, 0);
+    /* 修改按钮颜色：变为浅灰色，更深 */
+    lv_obj_set_style_bg_color(s_fs_next_btn, lv_color_hex(0xE0E0E0), 0);
     lv_obj_set_style_bg_opa(s_fs_next_btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_fs_next_btn, 0, 0);
     lv_obj_set_style_shadow_width(s_fs_next_btn, 0, 0);
     lv_obj_add_event_cb(s_fs_next_btn, fs_next_click_cb, LV_EVENT_CLICKED, NULL);
-
+    
     lv_obj_t *next_lbl = lv_label_create(s_fs_next_btn);
     lv_label_set_text(next_lbl, ">");
     lv_obj_set_style_text_font(next_lbl, &chinese_16, 0);
+    /* 文字颜色也设为蓝色 */
     lv_obj_set_style_text_color(next_lbl, lv_color_hex(0x0000FF), 0);
     lv_obj_center(next_lbl);
 
     s_fs_group = "sdcard";
     fs_browser_show_page(0);
 }
+
 
 void fs_menu_click_cb(lv_event_t *e)
 {
@@ -331,5 +338,359 @@ void fs_browser_on_sd_remove(void)
     if (s_fs_overlay) {
         s_fs_group = NULL;
         fs_browser_show_page(0);
+    }
+}
+
+/* ────────────────────────────────────────────────────────────
+ * 蓝牙设备列表
+ * ──────────────────────────────────────────────────────────── */
+#define BT_W        135
+#define BT_H        220
+#define BT_X        13
+#define BT_Y        3
+#define BT_ROW_H    36
+#define BT_BUF_MAX  16
+#define COLOR_BT_BLUE  lv_color_hex(0x2196F3)
+#define COLOR_BT_RED   lv_color_hex(0xE53935)
+
+static lv_obj_t *s_bt_overlay   = NULL;
+static lv_obj_t *s_bt_cont      = NULL;
+static lv_obj_t *s_bt_title     = NULL;
+static lv_obj_t *s_bt_list      = NULL;
+static lv_obj_t *s_bt_card      = NULL;
+static lv_obj_t *s_bt_card_name = NULL;
+static lv_obj_t *s_bt_action_btn  = NULL;
+static lv_obj_t *s_bt_action_lbl  = NULL;
+
+static bool         s_bt_open = false;
+static bool         s_bt_scanning = false;
+static bt_state_t   s_bt_state = BT_STATE_DISCONNECTED;
+static char         s_bt_connect_name[32];
+
+static char         s_bt_display[BT_BUF_MAX][32];
+static int          s_bt_display_count = 0;
+static char         s_bt_pending[BT_BUF_MAX][32];
+static int          s_bt_pending_count = 0;
+
+static bt_a2dp_iface_t *s_bt_iface = NULL;
+
+static void bt_send_cmd(bt_cmd_type_t type, const char *name)
+{
+    if (!s_bt_iface) return;
+    bt_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = type;
+    if (name) {
+        strncpy(cmd.device_name, name, sizeof(cmd.device_name) - 1);
+    }
+    xQueueSend(s_bt_iface->cmd_queue, &cmd, 0);
+}
+
+static void bt_item_click_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    const char *name = (const char *)lv_obj_get_user_data(btn);
+    if (!name) return;
+
+    strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
+    s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
+    s_bt_state = BT_STATE_CONNECTING;
+
+    lv_label_set_text(s_bt_card_name, s_bt_connect_name);
+    lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_BLUE, 0);
+    lv_label_set_text(s_bt_action_lbl, "Connecting");
+
+    lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
+
+    bt_send_cmd(BT_CMD_CONNECT, name);
+}
+
+static void bt_action_click_cb(lv_event_t *e)
+{
+    if (s_bt_state == BT_STATE_CONNECTED) {
+        bt_send_cmd(BT_CMD_DISCONNECT, NULL);
+    }
+}
+
+static void bt_show_list_view(void)
+{
+    lv_obj_clear_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void bt_refresh_list(void)
+{
+    lv_obj_clean(s_bt_list);
+
+    if (s_bt_display_count == 0) {
+        lv_obj_t *btn = lv_list_add_btn(s_bt_list, NULL, "No devices");
+        lv_obj_set_height(btn, BT_ROW_H);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_t *label = lv_obj_get_child(btn, 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(label, lv_color_black(), 0);
+        return;
+    }
+
+    for (int i = 0; i < s_bt_display_count; i++) {
+        lv_obj_t *btn = lv_list_add_btn(s_bt_list, NULL, s_bt_display[i]);
+        lv_obj_set_height(btn, BT_ROW_H);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_set_style_pad_left(btn, 8, 0);
+
+        lv_obj_t *label = lv_obj_get_child(btn, 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(label, lv_color_black(), 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+
+        lv_obj_set_user_data(btn, s_bt_display[i]);
+        lv_obj_add_event_cb(btn, bt_item_click_cb, LV_EVENT_CLICKED, NULL);
+    }
+}
+
+static void bt_overlay_click_cb(lv_event_t *e)
+{
+    bt_menu_click_cb(e);
+}
+
+static void bt_list_open(void)
+{
+    if (s_bt_open) return;
+
+    s_bt_open = true;
+    s_bt_state = BT_STATE_DISCONNECTED;
+    memset(s_bt_connect_name, 0, sizeof(s_bt_connect_name));
+    s_bt_pending_count = 0;
+    s_bt_display_count = 0;
+
+    s_bt_overlay = lv_btn_create(lv_scr_act());
+    lv_obj_set_size(s_bt_overlay, 172, 320);
+    lv_obj_set_pos(s_bt_overlay, 0, 0);
+    lv_obj_set_style_bg_opa(s_bt_overlay, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_bt_overlay, 0, 0);
+    lv_obj_set_style_shadow_width(s_bt_overlay, 0, 0);
+    lv_obj_add_event_cb(s_bt_overlay, bt_overlay_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_clear_flag(s_bt_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_bt_cont = lv_obj_create(s_bt_overlay);
+    lv_obj_set_pos(s_bt_cont, BT_X, BT_Y);
+    lv_obj_set_size(s_bt_cont, BT_W, BT_H);
+    lv_obj_set_style_bg_color(s_bt_cont, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_bt_cont, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_bt_cont, 6, 0);
+    lv_obj_set_style_border_color(s_bt_cont, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_border_width(s_bt_cont, 1, 0);
+    lv_obj_set_style_pad_all(s_bt_cont, 0, 0);
+    lv_obj_clear_flag(s_bt_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_bt_title = lv_label_create(s_bt_cont);
+    lv_obj_set_pos(s_bt_title, 6, 4);
+    lv_obj_set_size(s_bt_title, BT_W - 12, 22);
+    lv_obj_set_style_text_font(s_bt_title, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(s_bt_title, lv_color_black(), 0);
+    lv_label_set_long_mode(s_bt_title, LV_LABEL_LONG_DOT);
+    lv_label_set_text(s_bt_title, "Bluetooth");
+
+    s_bt_list = lv_list_create(s_bt_cont);
+    lv_obj_set_pos(s_bt_list, 0, 28);
+    lv_obj_set_size(s_bt_list, BT_W, BT_H - 28);
+    lv_obj_set_style_bg_color(s_bt_list, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_bt_list, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_bt_list, 0, 0);
+    lv_obj_set_style_pad_all(s_bt_list, 0, 0);
+
+    s_bt_card = lv_obj_create(s_bt_cont);
+    lv_obj_set_pos(s_bt_card, 12, 40);
+    lv_obj_set_size(s_bt_card, BT_W - 24, 72);
+    lv_obj_set_style_bg_color(s_bt_card, COLOR_BT_BLUE, 0);
+    lv_obj_set_style_bg_opa(s_bt_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_bt_card, 12, 0);
+    lv_obj_set_style_border_width(s_bt_card, 0, 0);
+    lv_obj_set_style_pad_all(s_bt_card, 8, 0);
+    lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_bt_card_name = lv_label_create(s_bt_card);
+    lv_obj_set_style_text_font(s_bt_card_name, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(s_bt_card_name, lv_color_white(), 0);
+    lv_label_set_long_mode(s_bt_card_name, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(s_bt_card_name, BT_W - 40);
+    lv_label_set_text(s_bt_card_name, "");
+    lv_obj_align(s_bt_card_name, LV_ALIGN_CENTER, 0, 0);
+
+    s_bt_action_btn = lv_btn_create(s_bt_cont);
+    lv_obj_set_pos(s_bt_action_btn, 12, BT_H - 48);
+    lv_obj_set_size(s_bt_action_btn, BT_W - 24, 36);
+    lv_obj_set_style_radius(s_bt_action_btn, 10, 0);
+    lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_BLUE, 0);
+    lv_obj_set_style_bg_opa(s_bt_action_btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_bt_action_btn, 0, 0);
+    lv_obj_set_style_shadow_width(s_bt_action_btn, 0, 0);
+    lv_obj_add_event_cb(s_bt_action_btn, bt_action_click_cb, LV_EVENT_CLICKED, NULL);
+
+    s_bt_action_lbl = lv_label_create(s_bt_action_btn);
+    lv_label_set_text(s_bt_action_lbl, "Connecting");
+    lv_obj_set_style_text_font(s_bt_action_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_bt_action_lbl, lv_color_white(), 0);
+    lv_obj_center(s_bt_action_lbl);
+
+    lv_obj_add_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+
+    bt_send_cmd(BT_CMD_GET_STATE, NULL);
+}
+
+static void bt_list_close(void)
+{
+    if (!s_bt_open) return;
+
+    if (s_bt_scanning) {
+        bt_send_cmd(BT_CMD_STOP_SCAN, NULL);
+    }
+
+    s_bt_scanning = false;
+    s_bt_open = false;
+
+    if (s_bt_overlay) {
+        lv_obj_del(s_bt_overlay);
+    }
+    s_bt_overlay   = NULL;
+    s_bt_cont      = NULL;
+    s_bt_title     = NULL;
+    s_bt_list      = NULL;
+    s_bt_card      = NULL;
+    s_bt_card_name = NULL;
+    s_bt_action_btn  = NULL;
+    s_bt_action_lbl  = NULL;
+}
+
+void bt_list_init(bt_a2dp_iface_t *iface)
+{
+    s_bt_iface = iface;
+}
+
+void bt_menu_click_cb(lv_event_t *e)
+{
+    if (s_bt_open) {
+        bt_list_close();
+    } else {
+        bt_list_open();
+    }
+}
+
+void bt_list_on_device_found(const char *name)
+{
+    if (!s_bt_open) return;
+    if (s_bt_pending_count >= BT_BUF_MAX) return;
+    strncpy(s_bt_pending[s_bt_pending_count], name, sizeof(s_bt_pending[0]) - 1);
+    s_bt_pending[s_bt_pending_count][sizeof(s_bt_pending[0]) - 1] = '\0';
+    s_bt_pending_count++;
+}
+
+void bt_list_on_scan_done(void)
+{
+    if (!s_bt_open) return;
+    s_bt_scanning = false;
+
+    s_bt_display_count = s_bt_pending_count;
+    for (int i = 0; i < s_bt_pending_count; i++) {
+        strncpy(s_bt_display[i], s_bt_pending[i], sizeof(s_bt_display[0]) - 1);
+        s_bt_display[i][sizeof(s_bt_display[0]) - 1] = '\0';
+    }
+    s_bt_pending_count = 0;
+
+    bt_refresh_list();
+
+    if (s_bt_open && s_bt_state == BT_STATE_DISCONNECTED) {
+        s_bt_scanning = true;
+        bt_send_cmd(BT_CMD_SCAN, NULL);
+    }
+}
+
+void bt_list_on_connected(const char *name)
+{
+    if (name && name[0]) {
+        strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
+        s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
+    }
+    s_bt_state = BT_STATE_CONNECTED;
+    s_bt_scanning = false;
+
+    if (s_bt_open) {
+        lv_label_set_text(s_bt_card_name, s_bt_connect_name);
+        lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_RED, 0);
+        lv_label_set_text(s_bt_action_lbl, "Disconnect");
+
+        lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void bt_list_on_connect_failed(const char *name)
+{
+    s_bt_state = BT_STATE_DISCONNECTED;
+    s_bt_scanning = false;
+
+    if (s_bt_open) {
+        bt_show_list_view();
+        s_bt_scanning = true;
+        bt_send_cmd(BT_CMD_SCAN, NULL);
+    }
+}
+
+void bt_list_on_disconnected(void)
+{
+    s_bt_state = BT_STATE_DISCONNECTED;
+    s_bt_scanning = false;
+    memset(s_bt_connect_name, 0, sizeof(s_bt_connect_name));
+
+    if (s_bt_open) {
+        bt_show_list_view();
+        s_bt_scanning = true;
+        bt_send_cmd(BT_CMD_SCAN, NULL);
+    }
+}
+
+void bt_list_on_state_rsp(bt_state_t state, const char *name)
+{
+    if (!s_bt_open) return;
+
+    s_bt_state = state;
+
+    switch (state) {
+    case BT_STATE_DISCONNECTED:
+        bt_show_list_view();
+        s_bt_scanning = true;
+        bt_send_cmd(BT_CMD_SCAN, NULL);
+        break;
+    case BT_STATE_CONNECTING:
+        if (name && name[0]) {
+            strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
+            s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
+        }
+        lv_label_set_text(s_bt_card_name, s_bt_connect_name);
+        lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_BLUE, 0);
+        lv_label_set_text(s_bt_action_lbl, "Connecting");
+        lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case BT_STATE_CONNECTED:
+        if (name && name[0]) {
+            strncpy(s_bt_connect_name, name, sizeof(s_bt_connect_name) - 1);
+            s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
+        }
+        lv_label_set_text(s_bt_card_name, s_bt_connect_name);
+        lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_RED, 0);
+        lv_label_set_text(s_bt_action_lbl, "Disconnect");
+        lv_obj_clear_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
+        break;
+    default:
+        break;
     }
 }

@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 #include "audio_task.h"
 #include "decoder.h"
+#include "atomic_utils.h"
 
 #define AUDIO_TAG "AUDIO"
 
@@ -18,6 +19,10 @@
 
 /* MPEG1 stereo: 1152 samples × 2ch = 2304 int16_t */
 #define MP3_PCM_BUF_SAMPLES  (1152 * 2)
+
+extern "C" {
+volatile bool g_pcm_active = false;
+}
 
 typedef enum {
     STATE_IDLE = 0,
@@ -52,6 +57,8 @@ static void audio_task(void *arg)
     audio_rsp_t rsp;
 
     while(1){
+        atomic_store_bool(&g_pcm_active, (s_state == STATE_PLAYING));
+
         switch(s_state){
 
         case STATE_IDLE:
