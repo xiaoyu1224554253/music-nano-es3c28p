@@ -25,12 +25,12 @@ void touch_init(void)
     ESP_ERROR_CHECK(i2c_driver_install(TOUCH_I2C_PORT, conf.mode, 0, 0, 0));
 
     /* wake up: write 0xFE = 0x01 (DisAutoSleep) */
-    ESP_LOGI(TAG, "waking up touch...");
+    /*ESP_LOGI(TAG, "waking up touch...");
     uint8_t wake[] = {0xFE, 0x01};
     while (i2c_master_write_to_device(TOUCH_I2C_PORT, TOUCH_ADDR,
             wake, sizeof(wake), pdMS_TO_TICKS(50)) != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    }*/
     ESP_LOGI(TAG, "touch ready");
 }
 

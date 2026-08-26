@@ -7,6 +7,7 @@
 #include "lvgl_task.h"
 #include "audio_task.h"
 #include "bt_a2dp.h"
+#include "sys_monitor.h"
 
 static QueueHandle_t s_app_cmd_queue  = NULL;
 static QueueHandle_t s_audio_cmd_queue = NULL;
@@ -43,7 +44,9 @@ void app_main(void)
     };
     audio_task_init(&audio_params);
 
-    printf("\n系统就绪 | 输入命令: stats | free | scan | conn <名称> | disconn | play | stop | pause | info\n");
+    sys_monitor_init();
+
+    printf("\n系统就绪 | 输入命令: stats | ram | psram | vbat | temp | scan | conn <名称> | disconn | play | stop | pause | info\n");
 
     vTaskSuspend(NULL);
 }

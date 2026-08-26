@@ -19,10 +19,16 @@ else {
     if ($src_mtime -gt $build_mtime) { $regenerate = $true }
 }
 
+$PYTHON_EXE = "$env:IDF_PYTHON_ENV_PATH\Scripts\python.exe"
+
 if ($regenerate) {
     Write-Host "=== CMake 配置中... ===" -ForegroundColor Cyan
     & "$TOOLS\cmake\3.30.2\bin\cmake.exe" -S "$PROJ_DIR" -B "$BUILD_DIR" -G Ninja `
-        -DCMAKE_MAKE_PROGRAM="$TOOLS\ninja\1.12.1\ninja.exe" 2>&1 | ForEach-Object {
+        -DCMAKE_MAKE_PROGRAM="$TOOLS\ninja\1.12.1\ninja.exe" `
+        -DPYTHON_DEPS_CHECKED=1 `
+        -DPYTHON="$PYTHON_EXE" `
+        -DESP_PLATFORM=1 `
+        -DCCACHE_ENABLE=0 2>&1 | ForEach-Object {
         if ($_ -match "error|fatal|Error|CMake Error") { Write-Host $_ -ForegroundColor Red }
         elseif ($_ -match "warning|Warning") { Write-Host $_ -ForegroundColor Yellow }
         elseif ($_ -match "-- Configuring done|-- Generating done|-- Build files") { Write-Host $_ -ForegroundColor Green }

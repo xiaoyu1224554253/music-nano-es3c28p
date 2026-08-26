@@ -5,6 +5,10 @@
 #include "freertos/queue.h"
 #include "freertos/stream_buffer.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     AUDIO_CMD_PLAY            = 0,
     AUDIO_CMD_STOP            = 1,
@@ -15,6 +19,7 @@ typedef enum {
 
 typedef struct {
     audio_cmd_type_t type;
+    char             path[64];
 } audio_cmd_t;
 
 typedef enum {
@@ -32,5 +37,9 @@ typedef struct {
 } audio_task_params_t;
 
 void audio_task_init(const audio_task_params_t *params);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

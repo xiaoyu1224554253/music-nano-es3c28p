@@ -12,6 +12,7 @@
 #include "esp_gap_bt_api.h"
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
+#include "esp_timer.h"
 #include "bt_a2dp.h"
 
 #define BT_TAG              "BT_A2DP"
@@ -214,11 +215,18 @@ static void bt_a2dp_hdl_avrc_evt(uint16_t event, void *p_param)
 }
 
 /* ── A2DP data callback ── */
+static uint32_t s_cb_call_count    = 0;
+static uint64_t s_cb_total_bytes   = 0;
+static uint64_t s_cb_total_got     = 0;
+static int64_t  s_cb_last_print_us = 0;
+
 static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
 {
     if (!data || len <= 0) {
         return 0;
     }
+
+    s_cb_call_count++;
 
     if (!s_connected) {
         memset(data, 0, (size_t)len);
@@ -229,6 +237,18 @@ static int32_t bt_a2dp_data_cb(uint8_t *data, int32_t len)
     if (got < (size_t)len) {
         memset(data + got, 0, (size_t)len - got);
     }
+
+    s_cb_total_bytes += (uint64_t)len;
+    s_cb_total_got   += (uint64_t)got;
+
+    int64_t now = esp_timer_get_time();
+    if ((now - s_cb_last_print_us) >= 5000000LL) {
+        s_cb_last_print_us = now;
+        uint32_t rate = (uint32_t)(s_cb_total_got * 1000000LL / (uint64_t)(now > 0 ? now : 1));
+        printf("[BT_CB] 调用%5" PRIu32 "次 | len=%6" PRId32 " | 累计请求=%6" PRIu64 " | 累计读取=%6" PRIu64 " | 速率=%" PRIu32 " B/s\n",
+               s_cb_call_count, len, s_cb_total_bytes, s_cb_total_got, rate);
+    }
+
     return len;
 }
 
@@ -260,6 +280,7 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
         } else if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
                    a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
             ESP_LOGI(BT_TAG, "A2DP 流媒体已启动");
+            printf("[BT_EVT] STREAM_START 时间戳=%lld us\n", esp_timer_get_time());
             send_evt(BT_EVT_STREAM_READY, NULL, 0);
         }
         break;
@@ -452,7 +473,7 @@ static void bt_a2dp_task(void *arg)
     s_iface.pcm_stream = xStreamBufferCreate(8 * 1024, 512);
 
     s_dispatch_queue = xQueueCreate(10, sizeof(bt_dispatch_msg_t));
-    s_queue_set      = xQueueCreateSet(2);
+    s_queue_set      = xQueueCreateSet(8);
     xQueueAddToSet(s_iface.cmd_queue, s_queue_set);
     xQueueAddToSet(s_dispatch_queue, s_queue_set);
 
@@ -542,7 +563,7 @@ bt_a2dp_iface_t *bt_a2dp_init(void)
         return NULL;
     }
 
-    BaseType_t result = xTaskCreatePinnedToCore(bt_a2dp_task, "bt_a2dp", 3072, NULL, 10, NULL, 0);
+    BaseType_t result = xTaskCreatePinnedToCore(bt_a2dp_task, "bt_a2dp", 3072, NULL, 1, NULL, 0);
     if (result != pdPASS) {
         vSemaphoreDelete(s_init_sem);
         s_init_sem = NULL;

@@ -8,7 +8,9 @@
 #include "freertos/queue.h"
 #include "freertos/timers.h"
 #include "esp_heap_caps.h"
+#include "esp_psram.h"
 #include "sys_serial.h"
+#include "sys_monitor.h"
 
 #define SERIAL_TAG    "SYS_SERIAL"
 #define LINE_BUF_SIZE 64
@@ -74,7 +76,7 @@ static void cmd_stats(void)
     }
 
     printf("\n===== CPU 占用 (~%"PRIu32"ms 窗口) =====\n", delta_ms);
-    printf("%-20s %6s  %s\n", "任务名", "CPU%", "Core");
+    printf("%-20s %6s  %4s  %s\n", "任务名", "CPU%", "Prio", "Core");
 
     for (UBaseType_t i = 0; i < n; i++) {
         uint32_t delta_task = 0;
@@ -88,8 +90,8 @@ static void cmd_stats(void)
             }
         }
         float pct = (float)delta_task / (float)delta_total * 100.0f;
-        printf("%-20s %5.1f%%  %d\n",
-               cur[i].pcTaskName, pct, cur[i].xCoreID);
+        printf("%-20s %5.1f%%  %4u  %d\n",
+               cur[i].pcTaskName, pct, (unsigned)cur[i].uxCurrentPriority, cur[i].xCoreID);
     }
     printf("===============================\n");
 
@@ -98,9 +100,21 @@ static void cmd_stats(void)
 
 static void cmd_free(void)
 {
-    uint32_t total = esp_get_free_heap_size();
-    uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-    printf("[内存] 总空闲: %"PRIu32"KB  最大连续块: %"PRIu32"KB\n",
+    uint32_t total = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    printf("[RAM] 总空闲: %"PRIu32"KB  最大连续块: %"PRIu32"KB\n",
+           total / 1024, largest / 1024);
+}
+
+static void cmd_psram(void)
+{
+    if (!esp_psram_is_initialized()) {
+        printf("[PSRAM] 未启用\n");
+        return;
+    }
+    uint32_t total = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    printf("[PSRAM] 总空闲: %"PRIu32"KB  最大连续块: %"PRIu32"KB\n",
            total / 1024, largest / 1024);
 }
 
@@ -109,7 +123,7 @@ static void sys_serial_task(void *arg)
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
     printf("\n=== 音乐播放器 ===\n");
-    printf("系统命令: stats | free\n");
+    printf("系统命令: stats | ram | psram | vbat | temp\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
     printf("命令> ");
 
@@ -125,8 +139,16 @@ static void sys_serial_task(void *arg)
 
                     if (strcmp(line, "stats") == 0) {
                         cmd_stats();
-                    } else if (strcmp(line, "free") == 0) {
+                    } else if (strcmp(line, "ram") == 0) {
                         cmd_free();
+                    } else if (strcmp(line, "vbat") == 0) {
+                        float v = atomic_load_float(&g_vbat);
+                        printf("[电池] %.2f V\n", v);
+                    } else if (strcmp(line, "temp") == 0) {
+                        float t = atomic_load_float(&g_cpu_temp);
+                        printf("[CPU温度] %.1f C\n", t);
+                    } else if (strcmp(line, "psram") == 0) {
+                        cmd_psram();
                     } else {
                         app_cmd_t cmd;
                         memset(&cmd, 0, sizeof(cmd));
@@ -178,5 +200,5 @@ void sys_serial_init(QueueHandle_t app_cmd_queue)
                                        pdTRUE, NULL, stats_timer_cb);
     xTimerStart(timer, 0);
 
-    xTaskCreatePinnedToCore(sys_serial_task, "sys_serial", 2048, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(sys_serial_task, "sys_serial", 2048, NULL, 1, NULL, 1);
 }
