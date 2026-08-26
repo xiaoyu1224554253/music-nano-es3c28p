@@ -28,6 +28,8 @@ typedef enum {
     BT_EVT_CONNECTED       = 2,
     BT_EVT_CONNECT_FAILED  = 3,
     BT_EVT_DISCONNECTED    = 4,
+    BT_EVT_STREAM_READY    = 5,
+    BT_EVT_STREAM_STOPPED  = 6,
 } bt_evt_type_t;
 
 typedef struct {
