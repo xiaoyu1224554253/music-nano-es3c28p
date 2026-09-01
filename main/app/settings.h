@@ -14,30 +14,30 @@ extern "C" {
  */
 
 /* ── 音量 ── */
-#define VOLUME_MIN      0
-#define VOLUME_MAX      127
+#define VOLUME_MIN      0     /* 最小音量 (静音) */
+#define VOLUME_MAX      127   /* 最大音量 (蓝牙 A2DP 标准 0~127) */
 
-int32_t volume_get(void);
-void    volume_set(int32_t v);
-void    volume_inc(int32_t delta);
+int32_t volume_get(void);                       /* 读取当前音量 */
+void    volume_set(int32_t v);                  /* 设定音量 (内部钳制到 0~127, 并同步到蓝牙) */
+void    volume_inc(int32_t delta);              /* 音量增减 (delta 可为负) */
 
-void    volume_load_from_nvs(void);
-void    volume_save_to_nvs(void);
+void    volume_load_from_nvs(void);             /* 开机从 NVS 读音量 */
+void    volume_save_to_nvs(void);               /* 音量变化后写回 NVS */
 
 /* ── 亮度 ── */
-#define BRIGHTNESS_MIN      1
-#define BRIGHTNESS_MAX      255
-#define BRIGHTNESS_DEFAULT  128
+#define BRIGHTNESS_MIN      1     /* 最小背光亮度 (非 0, 避免全黑) */
+#define BRIGHTNESS_MAX      255   /* 最大背光亮度 */
+#define BRIGHTNESS_DEFAULT  128   /* 默认亮度 */
 
-uint8_t brightness_get(void);
-void    brightness_set(uint8_t v);
+uint8_t brightness_get(void);                   /* 读取当前背光亮度 */
+void    brightness_set(uint8_t v);              /* 设定背光亮度 (钳制到 1~255) */
 
-void    brightness_load_from_nvs(void);
-void    brightness_save_to_nvs(void);
+void    brightness_load_from_nvs(void);         /* 开机从 NVS 读亮度 */
+void    brightness_save_to_nvs(void);           /* 亮度变化后写回 NVS */
 
 /* ── 上次播放歌曲 ── */
-void last_song_save(const char *path);
-bool last_song_load(char *buf, size_t size);
+void last_song_save(const char *path);          /* 保存上次播放曲目路径到 NVS */
+bool last_song_load(char *buf, size_t size);    /* 读取上次播放曲目, 成功返回 true; buf=输出缓冲, size=缓冲大小 */
 
 /* ── 播放模式 ── */
 typedef enum {
@@ -46,8 +46,8 @@ typedef enum {
     PLAY_MODE_RANDOM,           /* 随机 */
 } play_mode_t;
 
-bool settings_mode_load(play_mode_t *mode);
-void settings_mode_save(play_mode_t mode);
+bool settings_mode_load(play_mode_t *mode);     /* 从 NVS 读播放模式, 成功返回 true; mode=输出 */
+void settings_mode_save(play_mode_t mode);      /* 保存播放模式到 NVS */
 
 #ifdef __cplusplus
 }

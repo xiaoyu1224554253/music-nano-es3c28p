@@ -9,6 +9,11 @@
 /// compile-time constant here, so the per-width branches below fold away at -O2.
 ///
 /// All pack/unpack functions assume little-endian byte order in the audio buffer.
+///
+/// 中文概览: 一组模板化工具, 负责把任意位深(1~4字节)的小端 PCM 样本与"左对齐 Q31 int32"
+/// 中间格式互转。unpack_to_q31=逐字节读出并符号扩展左对齐; pack_q31=把 Q31 高若干字节写回;
+/// fast_* 版本对 2/4 字节做单次宽 load/store 加速 (要求指针按样本宽度对齐)。
+/// 位深模板参数是编译期常量, -O2 下各分支会被完全折叠。
 
 #include <cstddef>
 #include <cstdint>

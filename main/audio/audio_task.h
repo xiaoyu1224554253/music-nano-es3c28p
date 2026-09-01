@@ -10,40 +10,44 @@
 extern "C" {
 #endif
 
-extern volatile bool g_pcm_active;
+extern volatile bool g_pcm_active;   /* 是否正在推送 PCM 到蓝牙 (全局标志) */
 
+/* 音频命令类型 (UI 通过 cmd_queue 发来) */
 typedef enum {
-    AUDIO_CMD_PLAY            = 0,
-    AUDIO_CMD_STOP            = 1,
-    AUDIO_CMD_PAUSE           = 2,
-    AUDIO_CMD_BT_CONNECTED    = 3,
-    AUDIO_CMD_BT_DISCONNECTED = 4,
-    AUDIO_CMD_SEEK            = 5,
+    AUDIO_CMD_PLAY            = 0,   /* 开始播放 (path=文件路径) */
+    AUDIO_CMD_STOP            = 1,   /* 停止播放 */
+    AUDIO_CMD_PAUSE           = 2,   /* 暂停 */
+    AUDIO_CMD_BT_CONNECTED    = 3,   /* 蓝牙已连接 (可开始推流) */
+    AUDIO_CMD_BT_DISCONNECTED = 4,   /* 蓝牙断开 (停推) */
+    AUDIO_CMD_SEEK            = 5,   /* 跳转 (param=字节偏移) */
 } audio_cmd_type_t;
 
+/* 音频命令结构体: type=命令, path=播放路径, param=附加参数 */
 typedef struct {
     audio_cmd_type_t type;
     char             path[256];
     uint32_t         param;
 } audio_cmd_t;
 
+/* 音频应答类型 (音频任务发给 UI 的通知) */
 typedef enum {
-    AUDIO_RSP_BT_CHECK       = 0,
-    AUDIO_RSP_FILE_NOT_FOUND = 1,
-    AUDIO_RSP_SONG_FINISHED  = 2,
+    AUDIO_RSP_BT_CHECK       = 0,   /* 检查蓝牙连接状态 */
+    AUDIO_RSP_FILE_NOT_FOUND = 1,   /* 文件不存在 */
+    AUDIO_RSP_SONG_FINISHED  = 2,   /* 一首歌播放完毕 */
 } audio_rsp_type_t;
 
 typedef struct {
-    audio_rsp_type_t type;
+    audio_rsp_type_t type;   /* 应答类型 */
 } audio_rsp_t;
 
+/* 音频任务初始化参数 */
 typedef struct {
-    QueueHandle_t        cmd_queue;
-    QueueHandle_t        rsp_queue;
-    StreamBufferHandle_t pcm_stream;
+    QueueHandle_t        cmd_queue;   /* 命令队列 (UI→音频) */
+    QueueHandle_t        rsp_queue;   /* 应答队列 (音频→UI) */
+    StreamBufferHandle_t pcm_stream;  /* 蓝牙 PCM 流缓冲 (解码后的音频写这里) */
 } audio_task_params_t;
 
-void audio_task_init(const audio_task_params_t *params);
+void audio_task_init(const audio_task_params_t *params);   /* 创建音频任务 */
 
 #ifdef __cplusplus
 }

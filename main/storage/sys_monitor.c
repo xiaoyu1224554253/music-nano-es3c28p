@@ -20,6 +20,7 @@
 #include "atomic_utils.h"
 #include "sys_monitor.h"
 
+/* 安全拷贝: 把 src 复制到 dst (目标大小 dst_sz), 保证结尾 '\0' */
 static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
 {
     if (dst_sz == 0) {
@@ -34,61 +35,67 @@ static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
 #define TAG_DETECT  "SD_DETECT"
 #define TAG_ADC     "SYS_MON"
 
-#define MOUNT_POINT  "/sdcard"
-#define PIN_SD_DETECT 13
+#define MOUNT_POINT  "/sdcard"       /* SD 卡挂载点 */
+#define PIN_SD_DETECT 13             /* SD 卡插入检测引脚 (高=未插入) */
 
-#define PIN_CLK 14
-#define PIN_CMD 15
-#define PIN_D0   2
+#define PIN_CLK 14                   /* SDMMC 时钟脚 */
+#define PIN_CMD 15                   /* SDMMC 命令脚 */
+#define PIN_D0   2                   /* SDMMC 数据线 (1bit 模式只需 D0) */
 
-#define VBAT_ADC_UNIT   ADC_UNIT_1
-#define VBAT_ADC_CHAN   ADC_CHANNEL_7
+#define VBAT_ADC_UNIT   ADC_UNIT_1   /* 电池电压使用的 ADC 单元 */
+#define VBAT_ADC_CHAN   ADC_CHANNEL_7 /* 电池电压 ADC 通道 */
 
-#define VBAT_DIVIDER_RATIO 2.0f
+#define VBAT_DIVIDER_RATIO 2.0f      /* 分压比: 电阻分压 2:1, 电压乘 2 还原 */
 
-#define SAMPLE_COUNT  10
-#define SAMPLE_DELAY_MS 10
-#define SENSOR_INTERVAL_TICKS 10
+#define SAMPLE_COUNT  10             /* 采样次数 (取平均滤波) */
+#define SAMPLE_DELAY_MS 10           /* 相邻两次采样间隔 */
+#define SENSOR_INTERVAL_TICKS 10     /* 传感器采样周期计数 (×100ms = 1s) */
 
-#define CPU_TEMP_OFFSET_C  20.0f
-#define MUSIC_CACHE        "/sdcard/.music_cache"
-#define FS_CACHE_MAGIC     0x4D555349
+#define CPU_TEMP_OFFSET_C  20.0f     /* CPU 内部温度传感器校准偏移 */
+#define MUSIC_CACHE        "/sdcard/.music_cache"   /* 音乐缓存目录 */
+#define FS_CACHE_MAGIC     0x4D555349              /* 文件缓存魔数 "MUSI" */
 
-volatile bool  g_sd_ready = false;
-volatile float g_vbat     = 0.0f;
-volatile float g_cpu_temp = 0.0f;
-volatile bool  g_sd_manual_rescan = false;
-fs_cache_t     *g_fs_cache     = NULL;
+/* 跨模块共享状态 */
+volatile bool  g_sd_ready = false;      /* SD 卡就绪标志 */
+volatile float g_vbat     = 0.0f;       /* 电池电压 (V) */
+volatile float g_cpu_temp = 0.0f;       /* CPU 温度 (C) */
+volatile bool  g_sd_manual_rescan = false;  /* 手动重扫标志 */
+fs_cache_t     *g_fs_cache     = NULL;      /* 文件缓存指针 (PSRAM) */
 
-static adc_oneshot_unit_handle_t s_adc_handle = NULL;
-static adc_cali_handle_t         s_cali_handle = NULL;
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;   /* ADC 单元句柄 */
+static adc_cali_handle_t         s_cali_handle = NULL;  /* ADC 校准句柄 (eFuse 两点校准) */
 
-static sdmmc_card_t *s_card    = NULL;
-static bool          s_mounted = false;
+static sdmmc_card_t *s_card    = NULL;   /* SD 卡信息结构体 */
+static bool          s_mounted = false;  /* 是否已挂载 */
 
-static fs_cache_t   *s_fs_cache_owned = NULL;
+static fs_cache_t   *s_fs_cache_owned = NULL;   /* 本模块持有的缓存指针 (用于释放) */
 
-static sd_event_cb_t  s_event_cb  = NULL;
-static void          *s_event_ctx = NULL;
+static sd_event_cb_t  s_event_cb  = NULL;   /* 磁盘事件回调 */
+static void          *s_event_ctx = NULL;   /* 回调用户数据 */
 
+/* 由 group/name 拼出真实路径:
+ * group="sdcard"        → /sdcard/name
+ * group="sdcard_sub"    → /sdcard/sub/name  ('%' 还原为 '/') */
 void fs_build_real_path(const char *group, const char *name,
                         char *out, size_t out_size)
 {
     const char *rel = group;
-    if (strncmp(rel, "sdcard", 6) == 0) {
+    if (strncmp(rel, "sdcard", 6) == 0) {   /* 去掉 "sdcard" 前缀 */
         rel += 6;
-        if (*rel == '_') rel++;
+        if (*rel == '_') rel++;             /* 去掉分组分隔符 '_' */
     }
     if (*rel == '\0') {
-        snprintf(out, out_size, "/sdcard/%s", name);
+        snprintf(out, out_size, "/sdcard/%s", name);   /* 根目录文件 */
     } else {
-        snprintf(out, out_size, "/sdcard/%s/%s", rel, name);
+        snprintf(out, out_size, "/sdcard/%s/%s", rel, name);   /* 子目录文件 */
         for (char *p = out; *p; p++) {
-            if (*p == '%') *p = '/';
+            if (*p == '%') *p = '/';   /* 缓存文件名的 '%' 还原为路径分隔符 */
         }
     }
 }
 
+/* 把 SD 卡上的音乐缓存文件读入 PSRAM 构建文件索引.
+ * 三遍扫描: ①数条目数②登记子目录③登记文件; 返回 fs_cache_t 或 NULL. */
 static fs_cache_t *sd_load_cache_to_psram(void)
 {
     DIR *dir = opendir(MUSIC_CACHE);
@@ -97,16 +104,17 @@ static fs_cache_t *sd_load_cache_to_psram(void)
         return NULL;
     }
 
+    /* 第一遍: 统计总条目数, 以便一次性分配内存 */
     int total = 0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type != DT_REG) continue;
         const char *name = entry->d_name;
         const char *ext = strrchr(name, '.');
-        if (!ext || strcmp(ext, ".txt") != 0) continue;
-        if (strcmp(name, "space.dat") == 0) continue;
+        if (!ext || strcmp(ext, ".txt") != 0) continue;   /* 只要 .txt 缓存文件 */
+        if (strcmp(name, "space.dat") == 0) continue;     /* 跳过空间快照文件 */
 
-        if (strcmp(name, "sdcard.txt") == 0) {
+        if (strcmp(name, "sdcard.txt") == 0) {   /* 根目录缓存: 逐行统计文件数 */
             char path[512];
             snprintf(path, sizeof(path), "%s/sdcard.txt", MUSIC_CACHE);
             FILE *f = fopen(path, "r");
@@ -115,14 +123,14 @@ static fs_cache_t *sd_load_cache_to_psram(void)
                 while (fgets(line, sizeof(line), f)) {
                     size_t len = strlen(line);
                     while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
-                        line[--len] = '\0';
+                        line[--len] = '\0';   /* 去掉行尾换行 */
                     if (len > 0) total++;
                 }
                 fclose(f);
             }
         }
 
-        if (strncmp(name, "sdcard_", 7) == 0) {
+        if (strncmp(name, "sdcard_", 7) == 0) {   /* 子目录缓存: 1 目录 + 其文件数 */
             total++;  // directory entry
 
             char path[512];
@@ -147,6 +155,7 @@ static fs_cache_t *sd_load_cache_to_psram(void)
         return NULL;
     }
 
+    /* 一次性分配: 表头 + total 个条目, 放 PSRAM 省内部 RAM */
     size_t alloc_size = sizeof(fs_cache_t) + (size_t)total * sizeof(fs_entry_t);
     fs_cache_t *cache = heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM);
     if (!cache) {
@@ -157,6 +166,7 @@ static fs_cache_t *sd_load_cache_to_psram(void)
     cache->magic = FS_CACHE_MAGIC;
     cache->count = 0;
 
+    /* 第二遍: 登记所有子目录 (sdcard_xxx.txt → 目录条目) */
     dir = opendir(MUSIC_CACHE);
     if (!dir) {
         heap_caps_free(cache);
@@ -174,16 +184,17 @@ static fs_cache_t *sd_load_cache_to_psram(void)
             char group[FS_GROUP_MAX];
             buf_copy(group, FS_GROUP_MAX, name);
             char *dot = strrchr(group, '.');
-            if (dot) *dot = '\0';
+            if (dot) *dot = '\0';   /* 去掉 .txt 后缀, 得到 "sdcard_sub" */
 
-            buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, group + 7);
-            buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, "sdcard");
+            buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, group + 7);   /* 子目录名 (去前缀) */
+            buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, "sdcard");  /* 分组=根 */
             cache->entries[cache->count].is_dir = true;
             cache->count++;
         }
     }
     closedir(dir);
 
+    /* 第三遍: 登记文件条目 */
     dir = opendir(MUSIC_CACHE);
     if (!dir) {
         heap_caps_free(cache);
@@ -197,7 +208,7 @@ static fs_cache_t *sd_load_cache_to_psram(void)
         if (!ext || strcmp(ext, ".txt") != 0) continue;
         if (strcmp(name, "space.dat") == 0) continue;
 
-        if (strcmp(name, "sdcard.txt") == 0) {
+        if (strcmp(name, "sdcard.txt") == 0) {   /* 根目录文件 */
             char path[512];
             snprintf(path, sizeof(path), "%s/sdcard.txt", MUSIC_CACHE);
             FILE *f = fopen(path, "r");
@@ -208,8 +219,8 @@ static fs_cache_t *sd_load_cache_to_psram(void)
                     while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
                         line[--len] = '\0';
                     if (len > 0) {
-                        buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, line);
-                        buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, "sdcard");
+                        buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, line);   /* 文件名 */
+                        buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, "sdcard"); /* 根分组 */
                         cache->entries[cache->count].is_dir = false;
                         cache->count++;
                     }
@@ -218,11 +229,11 @@ static fs_cache_t *sd_load_cache_to_psram(void)
             }
         }
 
-        if (strncmp(name, "sdcard_", 7) == 0) {
+        if (strncmp(name, "sdcard_", 7) == 0) {   /* 子目录文件 */
             char group[FS_GROUP_MAX];
             buf_copy(group, FS_GROUP_MAX, name);
             char *dot = strrchr(group, '.');
-            if (dot) *dot = '\0';
+            if (dot) *dot = '\0';   /* "sdcard_sub" */
 
             char path[512];
             snprintf(path, sizeof(path), "%s/%s", MUSIC_CACHE, name);
@@ -234,8 +245,8 @@ static fs_cache_t *sd_load_cache_to_psram(void)
                     while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
                         line[--len] = '\0';
                     if (len > 0) {
-                        buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, line);
-                        buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, group);
+                        buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, line);   /* 文件名 */
+                        buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, group); /* 子目录分组 */
                         cache->entries[cache->count].is_dir = false;
                         cache->count++;
                     }
@@ -251,6 +262,7 @@ static fs_cache_t *sd_load_cache_to_psram(void)
     return cache;
 }
 
+/* 扫描 SD 卡根目录: 打印文件数 + 容量信息 (诊断用) */
 static void sd_scan_files(void)
 {
     int count = 0;
@@ -264,22 +276,24 @@ static void sd_scan_files(void)
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_REG) {
-            count++;
+            count++;   /* 数根目录普通文件数 */
         }
     }
     closedir(dir);
 
+    /* 容量信息 (FatFs 查询) */
     FATFS *fs;
     DWORD free_clst;
     FRESULT fr = f_getfree(MOUNT_POINT, &free_clst, &fs);
     if (fr == FR_OK) {
-        uint64_t total_kb = ((uint64_t)fs->n_fatent - 2) * fs->csize / 2;
-        uint64_t free_kb  = (uint64_t)free_clst * fs->csize / 2;
+        uint64_t total_kb = ((uint64_t)fs->n_fatent - 2) * fs->csize / 2;   /* 总量 */
+        uint64_t free_kb  = (uint64_t)free_clst * fs->csize / 2;            /* 剩余 */
         ESP_LOGI(TAG_SDMMC, "存储: 总量 %llu KB, 剩余 %llu KB",
                  total_kb, free_kb);
     }
 }
 
+/* 在缓存中按完整路径查找文件, 输出其 group/name (供 UI 定位分组) */
 bool fs_cache_find_by_path(const char *path,
                            char *group_out, size_t group_size,
                            char *name_out, size_t name_size)
@@ -288,15 +302,15 @@ bool fs_cache_find_by_path(const char *path,
 
     for (int i = 0; i < g_fs_cache->count; i++) {
         fs_entry_t *e = &g_fs_cache->entries[i];
-        if (e->is_dir) continue;
+        if (e->is_dir) continue;   /* 跳过目录条目 */
 
         char real[512];
-        fs_build_real_path(e->group, e->name, real, sizeof(real));
+        fs_build_real_path(e->group, e->name, real, sizeof(real));   /* 拼真实路径 */
         if (strcmp(real, path) == 0) {
-            if (group_out && group_size > 0) {
+            if (group_out && group_size > 0) {   /* 输出 group */
                 buf_copy(group_out, group_size, e->group);
             }
-            if (name_out && name_size > 0) {
+            if (name_out && name_size > 0) {     /* 输出 name */
                 buf_copy(name_out, name_size, e->name);
             }
             return true;
@@ -308,18 +322,18 @@ bool fs_cache_find_by_path(const char *path,
 void sdmmc_disk_init(void)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024,
+        .format_if_mount_failed = false,   /* 挂载失败不格式化 (保护数据) */
+        .max_files = 5,                    /* 同时打开文件数上限 */
+        .allocation_unit_size = 16 * 1024, /* 分配单元 16KB */
     };
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.width = 1;
-    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+    slot_config.width = 1;                                /* 1bit 模式 */
+    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP; /* 使用内部上拉 */
 
-#ifdef CONFIG_SOC_SDMMC_USE_GPIO_MATRIX
+#ifdef CONFIG_SOC_SDMMC_USE_GPIO_MATRIX   /* 某些芯片 SDMMC 引脚可映射, 指定自定义引脚 */
     slot_config.clk = PIN_CLK;
     slot_config.cmd = PIN_CMD;
     slot_config.d0  = PIN_D0;
@@ -334,14 +348,14 @@ void sdmmc_disk_init(void)
         return;
     }
 
-    sdmmc_card_print_info(stdout, s_card);
+    sdmmc_card_print_info(stdout, s_card);   /* 打印卡信息 (容量/类型等) */
     s_mounted = true;
     ESP_LOGI(TAG_SDMMC, "SD 卡已挂载");
 
-    sd_scan_files();
-    music_scan_init();
+    sd_scan_files();           /* 诊断: 根目录文件数/容量 */
+    music_scan_init();         /* 扫描/加载音乐缓存 */
 
-    s_fs_cache_owned = sd_load_cache_to_psram();
+    s_fs_cache_owned = sd_load_cache_to_psram();   /* 把缓存读入 PSRAM 建索引 */
     g_fs_cache = s_fs_cache_owned;
     atomic_store_bool(&g_sd_ready, true);
 
@@ -378,6 +392,7 @@ bool sdmmc_disk_is_mounted(void)
     return s_mounted;
 }
 
+/* 注册磁盘事件回调: cb=回调函数, user_data=回调时透传的用户数据 */
 void sdmmc_disk_set_event_callback(sd_event_cb_t cb, void *user_data)
 {
     s_event_cb  = cb;
@@ -386,26 +401,29 @@ void sdmmc_disk_set_event_callback(sd_event_cb_t cb, void *user_data)
 
 extern uint8_t temprature_sens_read(void);
 
+/* 读取 CPU 内部温度 (华氏原始值 → 摄氏, 再减校准偏移) */
 static float read_cpu_temp(void)
 {
     return ((float)temprature_sens_read() - 32.0f) / 1.8f - CPU_TEMP_OFFSET_C;
 }
 
+/* 读取电池电压: ADC 原始值 → mV (优先 eFuse 校准, 否则线性估算) → V × 分压比 */
 static float read_vbat(void)
 {
     int raw;
-    adc_oneshot_read(s_adc_handle, VBAT_ADC_CHAN, &raw);
+    adc_oneshot_read(s_adc_handle, VBAT_ADC_CHAN, &raw);   /* 单次 ADC 采集 */
 
     int mv = 0;
     if (s_cali_handle != NULL) {
-        adc_cali_raw_to_voltage(s_cali_handle, raw, &mv);
+        adc_cali_raw_to_voltage(s_cali_handle, raw, &mv);   /* 校准曲线换算 */
     } else {
-        mv = raw * 3300 / 4095;
+        mv = raw * 3300 / 4095;   /* 兜底线性: 3.3V/12bit */
     }
 
-    return (float)mv / 1000.0f * VBAT_DIVIDER_RATIO;
+    return (float)mv / 1000.0f * VBAT_DIVIDER_RATIO;   /* mV→V, 再乘分压比还原真实电压 */
 }
 
+/* 传感器采样: 多次取平均, 抑制 ADC 噪声 */
 static void sample_sensors(void)
 {
     float temp_sum = 0.0f;
@@ -419,28 +437,31 @@ static void sample_sensors(void)
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
     }
 
-    float temp_avg = temp_sum / (float)SAMPLE_COUNT;
-    float vbat_avg = vbat_sum / (float)SAMPLE_COUNT;
+    float temp_avg = temp_sum / (float)SAMPLE_COUNT;   /* 温度平均 */
+    float vbat_avg = vbat_sum / (float)SAMPLE_COUNT;   /* 电压平均 */
 
-    atomic_store_float(&g_cpu_temp, temp_avg);
+    atomic_store_float(&g_cpu_temp, temp_avg);   /* 原子发布, 供 UI/控制台读取 */
     atomic_store_float(&g_vbat, vbat_avg);
 }
 
 static void sys_monitor_task(void *arg)
 {
-    gpio_set_direction(PIN_SD_DETECT, GPIO_MODE_INPUT);
+    gpio_set_direction(PIN_SD_DETECT, GPIO_MODE_INPUT);   /* SD 检测脚设为输入 */
 
+    /* 配置 ADC 单元 (单次采集) */
     adc_oneshot_unit_init_cfg_t unit_cfg = {
         .unit_id = VBAT_ADC_UNIT,
     };
     adc_oneshot_new_unit(&unit_cfg, &s_adc_handle);
 
+    /* 配置通道: 12bit, 量程 0~3.3V */
     adc_oneshot_chan_cfg_t chan_cfg = {
         .atten    = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
     adc_oneshot_config_channel(s_adc_handle, VBAT_ADC_CHAN, &chan_cfg);
 
+    /* 创建 eFuse 两点校准 (更精确), 失败则退回线性估算 */
     adc_cali_line_fitting_config_t cali_cfg = {
         .unit_id  = VBAT_ADC_UNIT,
         .atten    = ADC_ATTEN_DB_12,
@@ -450,50 +471,52 @@ static void sys_monitor_task(void *arg)
         ESP_LOGW(TAG_ADC, "eFuse 两点校准不可用, 退回线性估算");
     }
 
-    bool last = (gpio_get_level(PIN_SD_DETECT) == 1);
-    int  tick = SENSOR_INTERVAL_TICKS;
+    bool last = (gpio_get_level(PIN_SD_DETECT) == 1);   /* 初始检测电平 (true=未插入) */
+    int  tick = SENSOR_INTERVAL_TICKS;                  /* 采样倒计时, 初始即采样 */
 
     ESP_LOGI(TAG_DETECT, "启动, GPIO%d 初始=%s", PIN_SD_DETECT, last ? "未插入" : "已插入");
 
-    if (!last) {
+    if (!last) {   /* 开机时卡已在 → 直接挂载 */
         sdmmc_disk_init();
     }
 
     while (1) {
-        bool current = (gpio_get_level(PIN_SD_DETECT) == 1);
+        bool current = (gpio_get_level(PIN_SD_DETECT) == 1);   /* 当前电平 */
 
+        /* 手动重扫: 模拟拔卡→插卡流程 */
         if (g_sd_manual_rescan) {
             g_sd_manual_rescan = false;
             ESP_LOGI(TAG_DETECT, "手动触发重新扫描");
-            g_music_scan_force = true;
+            g_music_scan_force = true;               /* 强制音乐全量重扫 */
             sdmmc_disk_deinit();
             vTaskDelay(pdMS_TO_TICKS(500));
             sdmmc_disk_init();
             last = (gpio_get_level(PIN_SD_DETECT) == 1);
         }
 
-        if (last && !current) {
+        if (last && !current) {   /* 高→低: 插入 */
             ESP_LOGI(TAG_DETECT, "检测到 SD 卡插入");
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(500));   /* 等卡稳定 */
             sdmmc_disk_init();
         }
 
-        if (!last && current) {
+        if (!last && current) {   /* 低→高: 拔出 */
             ESP_LOGI(TAG_DETECT, "检测到 SD 卡拔出");
             sdmmc_disk_deinit();
         }
 
         last = current;
 
-        if (++tick >= SENSOR_INTERVAL_TICKS) {
+        if (++tick >= SENSOR_INTERVAL_TICKS) {   /* 每 SENSOR_INTERVAL_TICKS 次循环采一次传感器 */
             tick = 0;
             sample_sensors();
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(100));   /* 轮询周期 100ms */
     }
 }
 
+/* 启动系统监视任务 (固定 core 1) */
 void sys_monitor_init(void)
 {
     xTaskCreatePinnedToCore(sys_monitor_task, "sys_monitor", 8192, NULL, 1, NULL, 1);

@@ -7,20 +7,24 @@
 /* ────────────────────────────────────────────
  * 通用面板 打开/关闭 展开动画 (截图到 PSRAM + 顶部图片层)
  * 文件浏览器与蓝牙列表共用
+ *
+ * 原理: 先把主界面和面板各截图到 PSRAM, 隐藏真实控件,
+ * 在 LVGL 顶层放两张图片 (背景 + 面板), 用定时器按"裁切窗口"
+ * 逐帧合成动画图, 手动刷新显示; 动画结束恢复真实控件。
  * ──────────────────────────────────────────── */
-#define ANIM_FS_START    30
+#define ANIM_FS_START    30   /* 动画起始尺寸 (最小可见尺寸) */
 #define ANIM_FS_MS_OPEN  150   /* 打开动画: 先快后慢 (ease-out) */
 #define ANIM_FS_MS_CLOSE 100   /* 关闭动画: 线性 */
 #define ANIM_PANEL_RADIUS 5    /* 面板圆角半径 (两容器统一写死) */
 
-static const panel_anim_cfg_t *s_anim_cfg    = NULL;
+static const panel_anim_cfg_t *s_anim_cfg    = NULL;   /* 当前动画配置 */
 static lv_obj_t      *s_anim_bg_img  = NULL;   /* 顶部背景图 (主界面截图) */
 static lv_obj_t      *s_anim_fs_img  = NULL;   /* 面板展开图 */
-static lv_img_dsc_t   s_anim_dsc_main;         /* 主界面全屏截图 */
-static lv_img_dsc_t   s_anim_dsc_fs;           /* 面板截图 */
-static lv_img_dsc_t   s_anim_dsc_buf;          /* 合成缓冲 (背景+面板裁切) */
-static uint8_t       *s_anim_buf_main = NULL;  /* PSRAM */
-static uint8_t       *s_anim_buf_fs   = NULL;  /* PSRAM */
+static lv_img_dsc_t   s_anim_dsc_main;         /* 主界面全屏截图描述符 */
+static lv_img_dsc_t   s_anim_dsc_fs;           /* 面板截图描述符 */
+static lv_img_dsc_t   s_anim_dsc_buf;          /* 合成缓冲 (背景+面板裁切) 描述符 */
+static uint8_t       *s_anim_buf_main = NULL;  /* 主界面截图 (PSRAM) */
+static uint8_t       *s_anim_buf_fs   = NULL;  /* 面板截图 (PSRAM) */
 static uint8_t       *s_anim_buf_anim = NULL;  /* PSRAM 合成缓冲 */
 static int32_t        s_anim_open     = 1;     /* 1=打开动画 0=关闭动画 */
 static int64_t        s_anim_t0       = 0;     /* 动画起始 esp_timer us */
@@ -37,6 +41,7 @@ static lv_area_t s_anim_chg_a;
 static lv_area_t s_anim_chg_b;
 static bool      s_anim_chg_valid = false;
 
+/* 分配动画缓冲: 优先 PSRAM, 失败回退内部 RAM */
 static void *fs_anim_alloc(uint32_t bytes)
 {
     void *p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);

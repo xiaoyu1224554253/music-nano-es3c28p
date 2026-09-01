@@ -10,6 +10,13 @@
 namespace esp_audio_libs {
 namespace pcm_convert {
 
+// 中文概览: 本文件实现交错 PCM 位深/声道转换。
+// 核心思路: 样本统一转成"左对齐 Q31 int32"处理 (unpack), 窄化时先四舍五入再截断 (round_for_output),
+// 再按输出位深写回 (pack)。输入输出通道数相同时把缓冲拍平成 1->1 转换走深度展开的
+// copy_frames_mono 热路径; 单声道→立体声有专门的广播展开 (copy_frames_mono_to_stereo);
+// 其余布局/1字节宽/未对齐指针走通用循环。指针按样本宽度对齐时可走宽 load/store 快路径。
+// copy_frames() 为入口, 内部按参数做多层模板分发, 全部在 -O2 折叠为对应特化。
+
 namespace {
 
 using internal::fast_pack_q31;
@@ -304,6 +311,8 @@ inline uintptr_t alignment_mask(uint8_t bps) {
 
 void copy_frames(const uint8_t *input, uint8_t *output, uint8_t input_bps, uint8_t input_channels, uint8_t output_bps,
                  uint8_t output_channels, uint32_t frames) {
+  /* 入口: input=源缓冲, output=目标缓冲, input_bps=源字节深(1~4), input_channels=源声道数,
+   * output_bps=目标字节深, output_channels=目标声道数, frames=帧数。参数非法则为无操作。 */
   if (frames == 0 || input_channels == 0 || output_channels == 0 || input_bps < 1 || input_bps > 4 ||
       output_bps < 1 || output_bps > 4) {
     return;

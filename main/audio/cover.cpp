@@ -33,18 +33,18 @@ static const char *jpeg_err_str(int err)
 }
 
 #define COVER_TAG         "COVER"
-#define COVER_SIZE        100
+#define COVER_SIZE        100            /* 封面输出尺寸 100x100 */
 #define COVER_PIXELS      (COVER_SIZE * COVER_SIZE)
-#define COVER_STACK_WORDS 4096
+#define COVER_STACK_WORDS 4096           /* 解码任务栈 (字) */
 
 /* LVGL 开了 LV_COLOR_16_SWAP, 最终输出缓冲需字节交换 */
 
-static QueueHandle_t     s_app_cmd_queue = NULL;
-static TaskHandle_t      s_task = NULL;
-static StaticTask_t     *s_tcb = NULL;
-static StackType_t      *s_stack = NULL;
-static SemaphoreHandle_t s_job_sem = NULL;
-static SemaphoreHandle_t s_slot_mutex = NULL;
+static QueueHandle_t     s_app_cmd_queue = NULL;   /* 完成通知队列 (发 APP_CMD_COVER_READY) */
+static TaskHandle_t      s_task = NULL;            /* 解码任务句柄 */
+static StaticTask_t     *s_tcb = NULL;             /* 静态任务 TCB (PSRAM) */
+static StackType_t      *s_stack = NULL;           /* 静态任务栈 (PSRAM) */
+static SemaphoreHandle_t s_job_sem = NULL;         /* 作业信号量 (计数=待处理作业数) */
+static SemaphoreHandle_t s_slot_mutex = NULL;      /* 保护 s_job_data/s_job_size */
 
 /* 待解码的封面源数据 (PSRAM, 所有权归封面模块, 解码后释放) */
 static uint8_t *s_job_data = NULL;
@@ -54,10 +54,11 @@ static uint16_t *s_out_buf = NULL;  /* 常驻 100x100 RGB565 输出 (PSRAM) */
 static JPEGIMAGE *s_jpeg = NULL;    /* 常驻解码器 (PSRAM) */
 
 static uint16_t *s_raw = NULL;      /* 解码中间缓冲 (PSRAM, 临时) */
-static int       s_raw_w = 0;
-static int       s_raw_h = 0;
+static int       s_raw_w = 0;       /* 中间缓冲宽 */
+static int       s_raw_h = 0;       /* 中间缓冲高 */
 
-/* JPEG 解码回调: 把 MCU 块拷进中间缓冲 (右边缘用 iWidthUsed, 并钳制到缓冲边界) */
+/* JPEG 解码回调: 把 MCU 块拷进中间缓冲 (右边缘用 iWidthUsed, 并钳制到缓冲边界).
+ * pDraw=解码器给的 MCU 块信息. 返回非 0 继续解码. */
 static int cover_jpeg_draw(JPEGDRAW *pDraw)
 {
     if (!s_raw) return 0;
@@ -75,17 +76,18 @@ static int cover_jpeg_draw(JPEGDRAW *pDraw)
     if (y + h > s_raw_h) h = s_raw_h - y;
     if (w <= 0 || h <= 0) return 1;
 
-    uint16_t *dest = s_raw + (size_t)y * s_raw_w + x;
+    uint16_t *dest = s_raw + (size_t)y * s_raw_w + x;   /* 目标位置 */
     const uint16_t *src = pDraw->pPixels;
-    while (h-- > 0) {
+    while (h-- > 0) {   /* 逐行拷贝 */
         memcpy(dest, src, (size_t)w * sizeof(uint16_t));
-        dest += s_raw_w;
+        dest += s_raw_w;               /* 源/目标行宽不同, 分别步进 */
         src  += (size_t)pDraw->iWidthUsed;
     }
     return 1;
 }
 
-/* 面积平均采样 (缩小时) */
+/* 面积平均采样 (缩小时): 求矩形区域内所有像素的 RGB 平均值.
+ * src=源缓冲, src_w=源宽, x0/y0/x1/y1=采样矩形. 返回平均后 RGB565. */
 static uint16_t cover_avg_box(const uint16_t *src, int src_w, int x0, int x1,
                               int y0, int y1)
 {
@@ -94,28 +96,30 @@ static uint16_t cover_avg_box(const uint16_t *src, int src_w, int x0, int x1,
         const uint16_t *row = src + (size_t)y * src_w;
         for (int x = x0; x <= x1; x++) {
             uint16_t p = row[x];
-            r += (p >> 11) & 0x1F;
-            g += (p >> 5)  & 0x3F;
-            b += p & 0x1F;
+            r += (p >> 11) & 0x1F;   /* RGB565 拆出 R 通道 */
+            g += (p >> 5)  & 0x3F;   /* G 通道 */
+            b += p & 0x1F;           /* B 通道 */
             cnt++;
         }
     }
-    r = (r + cnt / 2) / cnt;
+    r = (r + cnt / 2) / cnt;   /* 四舍五入平均 */
     g = (g + cnt / 2) / cnt;
     b = (b + cnt / 2) / cnt;
-    return (uint16_t)((r << 11) | (g << 5) | b);
+    return (uint16_t)((r << 11) | (g << 5) | b);   /* 重新拼回 RGB565 */
 }
 
-/* 居中裁方 + 缩放到 100x100 (标准 RGB565) */
+/* 居中裁方 + 缩放到 100x100 (标准 RGB565):
+ * 取源图中心的方形区域, 再按需缩小(面积平均)/放大(最近邻). */
 static void cover_scale_crop_to_100(const uint16_t *src, int src_w, int src_h)
 {
-    int side = src_w < src_h ? src_w : src_h;
-    int cx = (src_w - side) / 2;
-    int cy = (src_h - side) / 2;
+    int side = src_w < src_h ? src_w : src_h;   /* 方形边长 = 短边 */
+    int cx = (src_w - side) / 2;   /* 中心方区域左上角 x */
+    int cy = (src_h - side) / 2;   /* 中心方区域左上角 y */
 
     for (int ty = 0; ty < COVER_SIZE; ty++) {
         uint16_t *dst = s_out_buf + (size_t)ty * COVER_SIZE;
         if (side >= COVER_SIZE) {
+            /* 缩小: 每个输出像素对应源区域取平均 */
             int y0 = cy + (ty * side) / COVER_SIZE;
             int y1 = cy + ((ty + 1) * side) / COVER_SIZE - 1;
             if (y1 < y0) y1 = y0;
@@ -126,6 +130,7 @@ static void cover_scale_crop_to_100(const uint16_t *src, int src_w, int src_h)
                 dst[tx] = cover_avg_box(src, src_w, x0, x1, y0, y1);
             }
         } else {
+            /* 放大: 最近邻采样 */
             int sy = cy + (ty * side) / COVER_SIZE;
             for (int tx = 0; tx < COVER_SIZE; tx++) {
                 int sx = cx + (tx * side) / COVER_SIZE;
@@ -135,7 +140,7 @@ static void cover_scale_crop_to_100(const uint16_t *src, int src_w, int src_h)
     }
 }
 
-/* LV_COLOR_16_SWAP: 标准 RGB565 字节交换 */
+/* LV_COLOR_16_SWAP: 标准 RGB565 字节交换 (高低字节互换) */
 static void cover_swap_rgb565(uint16_t *buf, int n)
 {
     for (int i = 0; i < n; i++) {
@@ -143,10 +148,11 @@ static void cover_swap_rgb565(uint16_t *buf, int n)
     }
 }
 
-/* 用指定缩放选项解码一次: 成功返回 1 (已缩放写入 s_out_buf), 失败返回 0 */
+/* 用指定缩放选项解码一次: 成功返回 1 (已缩放写入 s_out_buf), 失败返回 0.
+ * opt=JPEG 缩放选项, w/h=原图尺寸 */
 static int cover_decode_attempt(int opt, int w, int h)
 {
-    int rw = w, rh = h;
+    int rw = w, rh = h;   /* 解码目标尺寸 (缩放后) */
     if (opt == JPEG_SCALE_EIGHTH)       { rw = w / 8; rh = h / 8; }
     else if (opt == JPEG_SCALE_QUARTER) { rw = w / 4; rh = h / 4; }
     else if (opt == JPEG_SCALE_HALF)    { rw = w / 2; rh = h / 2; }
@@ -159,26 +165,26 @@ static int cover_decode_attempt(int opt, int w, int h)
         JPEG_close(s_jpeg);
         return 0;
     }
-    s_raw = raw;
+    s_raw = raw;      /* 供解码回调写入 */
     s_raw_w = rw;
     s_raw_h = rh;
 
-    JPEG_setPixelType(s_jpeg, RGB565_LITTLE_ENDIAN);
-    uint8_t mode = s_jpeg->ucMode;
+    JPEG_setPixelType(s_jpeg, RGB565_LITTLE_ENDIAN);   /* 输出 RGB565 小端 */
+    uint8_t mode = s_jpeg->ucMode;    /* 记录编码模式 (诊断) */
     uint8_t comp = s_jpeg->ucNumComponents;
-    int rc = JPEG_decode(s_jpeg, 0, 0, opt);
+    int rc = JPEG_decode(s_jpeg, 0, 0, opt);   /* 执行解码 */
     int err = JPEG_getLastError(s_jpeg);
     JPEG_close(s_jpeg);
     s_raw = NULL;
 
-    if (rc != 1) {
+    if (rc != 1) {   /* 解码失败 */
         ESP_LOGW(COVER_TAG, "解码失败 rc=%d err=%d (%s) %dx%d mode=0x%02x comp=%u opt=%d",
                  rc, err, jpeg_err_str(err), w, h, mode, comp, opt);
         heap_caps_free(raw);
         return 0;
     }
 
-    cover_scale_crop_to_100(raw, rw, rh);
+    cover_scale_crop_to_100(raw, rw, rh);   /* 缩放居中裁方到 100x100 */
     heap_caps_free(raw);
     return 1;
 }
@@ -190,11 +196,12 @@ static void cover_send_result(bool ok)
     app_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = APP_CMD_COVER_READY;
-    void *buf = ok ? (void *)s_out_buf : NULL;
+    void *buf = ok ? (void *)s_out_buf : NULL;   /* 传指针 (指针按位拷贝进 param) */
     memcpy(cmd.param, &buf, sizeof(buf));
     xQueueSend(s_app_cmd_queue, &cmd, 0);
 }
 
+/* 解码一份封面数据: data=JPEG数据, size=大小. 结果通过命令队列通知 UI. */
 static void cover_decode_job(const uint8_t *data, size_t size)
 {
     if (!s_out_buf || !s_jpeg || !data || size == 0) {
@@ -202,7 +209,7 @@ static void cover_decode_job(const uint8_t *data, size_t size)
         return;
     }
 
-    int rc_open = JPEG_openRAM(s_jpeg, (uint8_t *)data, (int)size, cover_jpeg_draw);
+    int rc_open = JPEG_openRAM(s_jpeg, (uint8_t *)data, (int)size, cover_jpeg_draw);   /* 从内存打开 JPEG */
     if (rc_open != 1) {
         int err = JPEG_getLastError(s_jpeg);
         ESP_LOGW(COVER_TAG, "openRAM 失败 rc=%d err=%d (%s)", rc_open, err, jpeg_err_str(err));
@@ -220,7 +227,7 @@ static void cover_decode_job(const uint8_t *data, size_t size)
 
     int w = JPEG_getWidth(s_jpeg);
     int h = JPEG_getHeight(s_jpeg);
-    if (w <= 0 || h <= 0) {
+    if (w <= 0 || h <= 0) {   /* 尺寸无效 */
         JPEG_close(s_jpeg);
         cover_send_result(false);
         return;
@@ -228,6 +235,7 @@ static void cover_decode_job(const uint8_t *data, size_t size)
     ESP_LOGI(COVER_TAG, "封面 %dx%d mode=0x%02x comp=%u", w, h,
              s_jpeg->ucMode, s_jpeg->ucNumComponents);
 
+    /* 按尺寸选择缩放档: 尽量用最低解码分辨率省内存/时间 */
     int opt = 0;
     if (w / 8 >= COVER_SIZE && h / 8 >= COVER_SIZE) {
         opt = JPEG_SCALE_EIGHTH;
@@ -248,27 +256,29 @@ static void cover_decode_job(const uint8_t *data, size_t size)
             cover_send_result(false);
             return;
         }
-        if (s_jpeg->ucMode == 0xc2) {
+        if (s_jpeg->ucMode == 0xc2) {   /* 重开后仍是渐进式 */
             JPEG_close(s_jpeg);
             cover_send_result(false);
             return;
         }
-        ok = cover_decode_attempt(0, w, h);
+        ok = cover_decode_attempt(0, w, h);   /* 全尺寸解码 */
     }
     if (!ok) {
         cover_send_result(false);
         return;
     }
 
-    cover_swap_rgb565(s_out_buf, COVER_PIXELS);
+    cover_swap_rgb565(s_out_buf, COVER_PIXELS);   /* 适配 LVGL 字节序 */
     cover_send_result(true);
 }
 
+/* 封面解码任务: 等作业信号量, 取数据解码后释放 */
 static void cover_task(void *arg)
 {
     for (;;) {
-        if (!xSemaphoreTake(s_job_sem, portMAX_DELAY)) continue;
+        if (!xSemaphoreTake(s_job_sem, portMAX_DELAY)) continue;   /* 阻塞等作业 */
 
+        /* 取走作业 (互斥保护) */
         uint8_t *data;
         size_t size;
         xSemaphoreTake(s_slot_mutex, portMAX_DELAY);
@@ -279,18 +289,20 @@ static void cover_task(void *arg)
         xSemaphoreGive(s_slot_mutex);
 
         if (data && size > 0) {
-            cover_decode_job(data, size);
-            heap_caps_free(data);
+            cover_decode_job(data, size);   /* 解码并通知 UI */
+            heap_caps_free(data);           /* 释放作业数据 */
         }
     }
 }
 
+/* 启动封面解码任务: app_cmd_queue=完成通知要投递的命令队列 */
 void cover_init(QueueHandle_t app_cmd_queue)
 {
     s_app_cmd_queue = app_cmd_queue;
-    s_job_sem = xSemaphoreCreateCounting(4, 0);
+    s_job_sem = xSemaphoreCreateCounting(4, 0);   /* 计数信号量, 最多积压 4 个作业 */
     s_slot_mutex = xSemaphoreCreateMutex();
 
+    /* 常驻缓冲全部放 PSRAM, 省内部 RAM */
     s_out_buf = (uint16_t *)heap_caps_malloc(COVER_PIXELS * sizeof(uint16_t),
                                              MALLOC_CAP_SPIRAM);
     s_jpeg = (JPEGIMAGE *)heap_caps_malloc(sizeof(JPEGIMAGE), MALLOC_CAP_SPIRAM);
@@ -304,11 +316,13 @@ void cover_init(QueueHandle_t app_cmd_queue)
         return;
     }
 
+    /* 静态创建: 栈在 PSRAM, 固定 core 1 */
     s_task = xTaskCreateStaticPinnedToCore(cover_task, "cover", COVER_STACK_WORDS,
                                            NULL, 1, s_stack, s_tcb, 1);
     ESP_LOGI(COVER_TAG, "封面解码任务已创建 (PSRAM 栈)");
 }
 
+/* 提交封面解码作业: jpg=JPEG数据 (所有权移交封面模块), size=数据大小 */
 void cover_submit_job(const uint8_t *jpg, size_t size)
 {
     if (!jpg || size == 0 || !s_task || !s_job_sem || !s_slot_mutex) return;
@@ -321,9 +335,10 @@ void cover_submit_job(const uint8_t *jpg, size_t size)
     s_job_size = size;
     xSemaphoreGive(s_slot_mutex);
 
-    xSemaphoreGive(s_job_sem);
+    xSemaphoreGive(s_job_sem);   /* 唤醒解码任务 */
 }
 
+/* 通知 UI: 当前歌曲无内嵌封面, 回退默认图标 */
 void cover_notify_no_cover(void)
 {
     cover_send_result(false);

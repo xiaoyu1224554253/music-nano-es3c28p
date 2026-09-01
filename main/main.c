@@ -12,30 +12,38 @@
 #include "sys_monitor.h"
 #include "cover.h"
 
-static QueueHandle_t s_app_cmd_queue  = NULL;
-static QueueHandle_t s_audio_cmd_queue = NULL;
-static QueueHandle_t s_audio_rsp_queue = NULL;
+/* 系统级消息队列句柄 (跨模块共享) */
+static QueueHandle_t s_app_cmd_queue  = NULL;   /* 应用命令队列: console→app 层(扫描/连接/播放等) */
+static QueueHandle_t s_audio_cmd_queue = NULL;  /* 音频命令队列: UI→音频任务(播放/停止/音量等) */
+static QueueHandle_t s_audio_rsp_queue = NULL;  /* 音频应答队列: 音频任务→UI(当前歌曲/状态回调) */
 
+/* 系统入口: 初始化各子系统并启动对应任务.
+ * 所有任务由子系统 init 内部创建, 本函数最后把自己挂起, 只保留各任务在跑. */
 void app_main(void)
 {
-    /* 最先: 开外设供电 + LCD 前半段 (SPI/面板/SLPOUT, 非阻塞), 让 120ms 在启动期间流逝 */
+    /* 最先: 开外设供电 + LCD 前半段 (SPI/面板/SLPOUT, 非阻塞), 让 120ms 在启动期间流逝.
+     * 这样把 LCD 上电时序 "藏" 进后续初始化时间里, 减少用户可见的启动延迟. */
     power_mgr_early_init();
     lcd_init_early(SPI2_HOST);
 
-    nvs_flash_init();
+    nvs_flash_init();   /* 初始化非易失存储 (保存配对信息/亮度/音量等设置) */
 
-    s_app_cmd_queue  = xQueueCreate(10, sizeof(app_cmd_t));
-    s_audio_cmd_queue = xQueueCreate(10, sizeof(audio_cmd_t));
-    s_audio_rsp_queue = xQueueCreate(5,  sizeof(audio_rsp_t));
+    /* 创建三个系统队列 (容量 10/10/5, 元素为对应命令结构体) */
+    s_app_cmd_queue  = xQueueCreate(10, sizeof(app_cmd_t));    /* 应用命令 */
+    s_audio_cmd_queue = xQueueCreate(10, sizeof(audio_cmd_t)); /* 音频命令 */
+    s_audio_rsp_queue = xQueueCreate(5,  sizeof(audio_rsp_t)); /* 音频应答 */
 
+    /* 初始化蓝牙 A2DP 子系统; 返回的接口给 UI/音频共用 */
     bt_a2dp_iface_t *bt_iface = bt_a2dp_init();
     if (!bt_iface) {
         printf("FATAL: 蓝牙初始化失败\n");
         return;
     }
 
+    /* 串口控制台: 把解析出的命令发给 app 队列 */
     console_init(s_app_cmd_queue);
 
+    /* UI 子系统参数: 命令/应答队列 + 蓝牙接口 */
     ui_params_t ui_params = {
         .app_cmd_queue   = s_app_cmd_queue,
         .bt_iface        = bt_iface,
@@ -44,6 +52,7 @@ void app_main(void)
     };
     ui_core_init(&ui_params);
 
+    /* 音频任务参数: 命令/应答队列 + 蓝牙 PCM 流接口 */
     audio_task_params_t audio_params = {
         .cmd_queue  = s_audio_cmd_queue,
         .rsp_queue  = s_audio_rsp_queue,
@@ -51,11 +60,13 @@ void app_main(void)
     };
     audio_task_init(&audio_params);
 
+    /* 系统监视任务: 电池电压/CPU温度采样 + SD卡检测 */
     sys_monitor_init();
 
+    /* 封面解码任务: 解析内嵌专辑封面 (经 app 命令队列通知) */
     cover_init(s_app_cmd_queue);
 
     printf("\n系统就绪 | 输入命令: stats | ram | psram | vbat | temp | scan | conn <名称> | disconn | play | stop | pause | info\n");
 
-    vTaskSuspend(NULL);
+    vTaskSuspend(NULL);   /* 入口任务不再需要, 永久挂起释放 CPU */
 }

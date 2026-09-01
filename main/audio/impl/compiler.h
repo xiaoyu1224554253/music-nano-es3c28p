@@ -5,6 +5,11 @@
 ///
 /// Wraps GCC/Clang builtins behind macros that fall back to portable C++ on other
 /// compilers, so source files can use one spelling regardless of toolchain.
+///
+/// 中文概览: 本文件为 esp-audio-libs 私有的编译器辅助宏——
+/// EAL_MEMCPY=绕过 ESP-IDF -fno-builtin-memcpy 的内联拷贝宏,
+/// EAL_HOT=标记热函数 (优化+指令缓存友好), EAL_ASSUME_ALIGNED=告诉编译器指针按 n 字节对齐.
+/// 目的: 一行宏名即可兼容 GCC/Clang 与其他编译器, 并在 Xtensa 上生成更紧凑的访存指令.
 
 // Inline memcpy that bypasses ESP-IDF's -fno-builtin-memcpy. The plain `memcpy`
 // name is forced to a real call so the linker can resolve it to the ROM-resident

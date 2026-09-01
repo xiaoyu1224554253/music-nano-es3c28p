@@ -19,17 +19,19 @@ extern "C" {
 
 typedef struct resampler_fxp_s resampler_fxp_t;
 
-resampler_fxp_t *resampler_fxp_create(void);
+resampler_fxp_t *resampler_fxp_create(void);   /* 创建重采样器对象 */
 
 /* 配置为 src_rate → 44100 重采样; channels 1 或 2。返回 false 表示分配失败。 */
 bool resampler_fxp_open(resampler_fxp_t *r, uint32_t src_rate, uint8_t channels);
 
-/* 重采样一块交错 int16 输入, 写入交错 int16 输出。返回实际输出帧数。 */
+/* 重采样一块交错 int16 输入, 写入交错 int16 输出。
+ * src=输入, src_frames=输入帧数, dst=输出, dst_cap_frames=输出缓冲可容纳帧数.
+ * 返回实际输出帧数. */
 size_t resampler_fxp_process(resampler_fxp_t *r, const int16_t *src, size_t src_frames,
                              int16_t *dst, size_t dst_cap_frames);
 
-void resampler_fxp_close(resampler_fxp_t *r);
-void resampler_fxp_free(resampler_fxp_t *r);
+void resampler_fxp_close(resampler_fxp_t *r);   /* 释放系数等资源 */
+void resampler_fxp_free(resampler_fxp_t *r);    /* 释放对象 */
 
 #ifdef __cplusplus
 }

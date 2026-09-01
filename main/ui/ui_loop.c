@@ -19,49 +19,52 @@
 
 #define LVGL_TAG "LVGL"
 
-static QueueSetHandle_t s_queue_set = NULL;
+static QueueSetHandle_t s_queue_set = NULL;   /* 队列集: 聚合三个输入队列 */
 
+/* LVGL 主任务: 跑 LVGL 渲染循环 + 分发 app/蓝牙/音频事件 */
 void ui_loop_task(void *arg)
 {
+    /* 初始化显示/触摸驱动, 建 UI 各界面 */
     ui_core_display_init();
 
-    ui_player_init();
-    bt_list_init(g_ui_bt_iface);
-    fs_list_set_play_cb(player_play_file);
+    ui_player_init();                    /* 播放器主界面 */
+    bt_list_init(g_ui_bt_iface);         /* 蓝牙列表 */
+    fs_list_set_play_cb(player_play_file);   /* 文件列表点击 → 播放回调 */
 
+    /* 三个事件源聚合到一个队列集, 统一非阻塞轮询 */
     s_queue_set = xQueueCreateSet(3);
-    xQueueAddToSet(g_ui_app_cmd_queue,  s_queue_set);
-    xQueueAddToSet(g_ui_bt_iface->evt_queue, s_queue_set);
-    xQueueAddToSet(g_ui_audio_rsp_queue, s_queue_set);
+    xQueueAddToSet(g_ui_app_cmd_queue,  s_queue_set);         /* 应用命令 */
+    xQueueAddToSet(g_ui_bt_iface->evt_queue, s_queue_set);    /* 蓝牙事件 */
+    xQueueAddToSet(g_ui_audio_rsp_queue, s_queue_set);        /* 音频应答 */
 
     /* LCD 后半段: 距 SLPOUT ≥120ms 后发寄存器命令 + DISPON (不足则阻塞补齐) */
     lcd_init_finish();
-    lv_timer_handler();
-    power_mgr_init();   
+    lv_timer_handler();   /* 跑一帧, 让界面先画出来 */
+    power_mgr_init();     /* 电源管理 (背光渐入/按键) */
 
-
-    app_cmd_t   app_cmd;
-    bt_evt_t    bt_evt;
-    audio_rsp_t audio_rsp;
-    audio_cmd_t audio_cmd;
-    bt_cmd_t    bt_cmd;
+    app_cmd_t   app_cmd;      /* 应用命令 */
+    bt_evt_t    bt_evt;       /* 蓝牙事件 */
+    audio_rsp_t audio_rsp;    /* 音频应答 */
+    audio_cmd_t audio_cmd;    /* 音频命令 (转发用) */
+    bt_cmd_t    bt_cmd;       /* 蓝牙命令 (转发用) */
 
     while (1) {
-        lv_timer_handler();
+        lv_timer_handler();   /* LVGL 渲染/动画/定时器 */
 
-        QueueHandle_t active = xQueueSelectFromSet(s_queue_set, 0);
+        QueueHandle_t active = xQueueSelectFromSet(s_queue_set, 0);   /* 查是否有事件 */
 
+        /* ── 应用命令 (串口控制台) ── */
         if (active == g_ui_app_cmd_queue) {
             while (xQueueReceive(g_ui_app_cmd_queue, &app_cmd, 0) == pdTRUE) {
                 switch (app_cmd.type) {
-                case APP_CMD_BT_SCAN:
+                case APP_CMD_BT_SCAN:   /* 转发蓝牙扫描命令 */
                     memset(&bt_cmd, 0, sizeof(bt_cmd));
                     bt_cmd.type = BT_CMD_SCAN;
                     xQueueSend(g_ui_bt_iface->cmd_queue, &bt_cmd, 0);
                     printf("[LVGL] scan\n");
                     break;
 
-                case APP_CMD_BT_CONNECT:
+                case APP_CMD_BT_CONNECT:   /* 转发蓝牙连接命令 */
                     if (bt_a2dp_is_connected()) {
                         printf("[LVGL] already connected\n");
                     } else {
@@ -75,14 +78,14 @@ void ui_loop_task(void *arg)
                     }
                     break;
 
-                case APP_CMD_BT_DISCONNECT:
+                case APP_CMD_BT_DISCONNECT:   /* 转发断开命令 */
                     memset(&bt_cmd, 0, sizeof(bt_cmd));
                     bt_cmd.type = BT_CMD_DISCONNECT;
                     xQueueSend(g_ui_bt_iface->cmd_queue, &bt_cmd, 0);
                     printf("[LVGL] disconnecting\n");
                     break;
 
-                case APP_CMD_PLAY:
+                case APP_CMD_PLAY:   /* 播放固定测试曲 (已连蓝牙才可) */
                     if (bt_a2dp_is_connected()) {
                         struct stat st;
                         if (!sdmmc_disk_is_mounted()) {
@@ -101,26 +104,26 @@ void ui_loop_task(void *arg)
                     }
                     break;
 
-                case APP_CMD_STOP:
+                case APP_CMD_STOP:   /* 停止 */
                     audio_cmd.type = AUDIO_CMD_STOP;
                     xQueueSend(g_ui_audio_cmd_queue, &audio_cmd, 0);
                     player_set_was_playing(false);
                     break;
 
-                case APP_CMD_PAUSE:
+                case APP_CMD_PAUSE:   /* 暂停 */
                     audio_cmd.type = AUDIO_CMD_PAUSE;
                     xQueueSend(g_ui_audio_cmd_queue, &audio_cmd, 0);
                     break;
 
-                case APP_CMD_INFO:
+                case APP_CMD_INFO:   /* 打印状态 */
                     printf("[info] connected: %s | playing: %s\n",
                            bt_a2dp_is_connected() ? "yes" : "no",
                            player_was_playing() ? "yes" : "no");
                     break;
 
-                case APP_CMD_COVER_READY: {
+                case APP_CMD_COVER_READY: {   /* 封面解码完成 */
                     void *buf;
-                    memcpy(&buf, app_cmd.param, sizeof(buf));
+                    memcpy(&buf, app_cmd.param, sizeof(buf));   /* 取出封面缓冲指针 */
                     player_show_cover(buf);
                     break;
                 }
@@ -128,16 +131,17 @@ void ui_loop_task(void *arg)
             }
         }
 
+        /* ── 蓝牙事件 ── */
         if (active == g_ui_bt_iface->evt_queue) {
             while (xQueueReceive(g_ui_bt_iface->evt_queue, &bt_evt, 0) == pdTRUE) {
                 switch (bt_evt.type) {
-                case BT_EVT_DEVICE_FOUND:
+                case BT_EVT_DEVICE_FOUND:   /* 扫描到设备 → 列表 */
                     bt_list_on_device_found(bt_evt.device_name);
                     break;
                 case BT_EVT_SCAN_DONE:
                     bt_list_on_scan_done();
                     break;
-                case BT_EVT_CONNECTED:
+                case BT_EVT_CONNECTED:   /* 连接成功 → 通知音频准备推流 */
                     audio_cmd.type = AUDIO_CMD_BT_CONNECTED;
                     xQueueSend(g_ui_audio_cmd_queue, &audio_cmd, 0);
                     bt_list_on_connected(bt_evt.device_name);
@@ -148,7 +152,7 @@ void ui_loop_task(void *arg)
                 case BT_EVT_CONNECT_FAILED:
                     bt_list_on_connect_failed(bt_evt.device_name);
                     break;
-                case BT_EVT_DISCONNECTED:
+                case BT_EVT_DISCONNECTED:   /* 断开 → 通知音频停推 */
                     audio_cmd.type = AUDIO_CMD_BT_DISCONNECTED;
                     xQueueSend(g_ui_audio_cmd_queue, &audio_cmd, 0);
                     bt_list_on_disconnected();
@@ -159,29 +163,30 @@ void ui_loop_task(void *arg)
                 case BT_EVT_STREAM_STOPPED:
                     printf("[stream stopped]\n");
                     break;
-                case BT_EVT_PLAY_PAUSE:
+                case BT_EVT_PLAY_PAUSE:   /* 耳机播放/暂停键 */
                     printf("[LVGL] BT 切换播放/暂停\n");
                     player_toggle_play();
                     break;
-                case BT_EVT_TRANSPORT_NEXT:
+                case BT_EVT_TRANSPORT_NEXT:   /* 耳机下一曲 */
                     printf("[LVGL] BT 下一曲\n");
                     player_next();
                     break;
-                case BT_EVT_TRANSPORT_PREV:
+                case BT_EVT_TRANSPORT_PREV:   /* 耳机上一曲 */
                     printf("[LVGL] BT 上一曲\n");
                     player_prev();
                     break;
-                case BT_EVT_STATE_RSP:
+                case BT_EVT_STATE_RSP:   /* 蓝牙状态应答 */
                     bt_list_on_state_rsp(bt_evt.state, bt_evt.device_name);
                     break;
                 }
             }
         }
 
+        /* ── 音频应答 ── */
         if (active == g_ui_audio_rsp_queue) {
             while (xQueueReceive(g_ui_audio_rsp_queue, &audio_rsp, 0) == pdTRUE) {
                 switch (audio_rsp.type) {
-                case AUDIO_RSP_BT_CHECK:
+                case AUDIO_RSP_BT_CHECK:   /* 核对蓝牙状态并回发音频 */
                     if (bt_a2dp_is_connected()) {
                         audio_cmd.type = AUDIO_CMD_BT_CONNECTED;
                     } else {
@@ -189,16 +194,16 @@ void ui_loop_task(void *arg)
                     }
                     xQueueSend(g_ui_audio_cmd_queue, &audio_cmd, 0);
                     break;
-                case AUDIO_RSP_FILE_NOT_FOUND:
+                case AUDIO_RSP_FILE_NOT_FOUND:   /* 文件不存在 */
                     player_on_file_not_found();
                     break;
-                case AUDIO_RSP_SONG_FINISHED:
+                case AUDIO_RSP_SONG_FINISHED:   /* 一首播放完 → 自动下一首 */
                     player_on_song_finished();
                     break;
                 }
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(2));   /* 让出 CPU 2ms */
     }
 }

@@ -2,6 +2,12 @@
 
 /// @file pcm_convert.h
 /// @brief Interleaved PCM conversion between bit depths and channel counts
+///
+/// 中文概览: 交错 PCM 的位深/声道数转换。
+/// 每输出帧逐声道构建: 输出声道多于输入时补末声道, 少于时丢弃末尾声道;
+/// 位深经 Q31 中间格式转换, 变窄时四舍五入(非截断)。输入输出格式一致时退化为 memcpy。
+/// 支持原地转换 (output==input) 的窄化/同格式场景; 非法原地调用会被检测为无操作。
+/// 8bit 样本按 int8 解释 (0x00 为静音), 多字节一律小端。
 
 #include <stddef.h>
 #include <stdint.h>

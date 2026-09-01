@@ -12,11 +12,11 @@ extern "C" {
  * 只做 10Hz 探测, 不反复读死从机 (规避 ESP32 原版 I2C FSM 卡死竞态).
  * LVGL 侧只读原子量, 永不直接操作 I2C. */
 
-void    touch_task_start(void);
-void    touch_task_set_enabled(bool en);      /* 息屏时 false: 停止读 I2C */
-bool    touch_is_present(void);                /* 原子读: 当前是否有效触点 */
-void    touch_get_point(int32_t *x, int32_t *y); /* 原子读: 原始坐标 */
-uint32_t touch_get_heartbeat(void);            /* 心跳: LVGL 检测任务是否停摆 */
+void    touch_task_start(void);                 /* 启动触摸采样任务 */
+void    touch_task_set_enabled(bool en);        /* 息屏时 false: 停止读 I2C */
+bool    touch_is_present(void);                 /* 原子读: 当前是否有效触点 */
+void    touch_get_point(int32_t *x, int32_t *y);/* 原子读: 原始坐标 (x/y 为输出参数) */
+uint32_t touch_get_heartbeat(void);             /* 心跳: LVGL 检测任务是否停摆 */
 
 #ifdef __cplusplus
 }

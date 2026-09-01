@@ -12,7 +12,8 @@ extern "C" {
 /* 显示屏 (JD9853, SPI).
  * 两段式初始化: lcd_init_early 在 app_main 头部 (建 SPI/面板 + SLPOUT, 非阻塞),
  * lcd_init_finish 在 lvgl 任务无限循环前 (距 SLPOUT≥120ms 后发寄存器命令 + DISPON).
- * 硬件复位由 bootloader 完成. */
+ * 硬件复位由 bootloader 完成.
+ * host: SPI 外设编号. 返回面板句柄. */
 esp_lcd_panel_handle_t lcd_init_early(spi_host_device_t host);
 esp_lcd_panel_handle_t lcd_init_finish(void);
 

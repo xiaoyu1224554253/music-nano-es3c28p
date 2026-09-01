@@ -4,36 +4,38 @@
 #include "menu.h"
 
 /* ── 蓝牙设备列表 ── */
-#define BT_W        135
-#define BT_H        220
-#define BT_X        13
-#define BT_Y        3
-#define BT_ROW_H    36
-#define BT_BUF_MAX  16
-#define COLOR_BT_BLUE  lv_color_hex(0x2196F3)
-#define COLOR_BT_RED   lv_color_hex(0xE53935)
+#define BT_W        135    /* 面板宽 */
+#define BT_H        220    /* 面板高 */
+#define BT_X        13     /* 面板左上角 X */
+#define BT_Y        3      /* 面板左上角 Y */
+#define BT_ROW_H    36     /* 每行设备高度 */
+#define BT_BUF_MAX  16     /* 设备列表缓冲上限 */
+#define COLOR_BT_BLUE  lv_color_hex(0x2196F3)   /* 连接中/操作色 */
+#define COLOR_BT_RED   lv_color_hex(0xE53935)   /* 断开色 */
 
-static lv_obj_t *s_bt_overlay   = NULL;
-static lv_obj_t *s_bt_cont      = NULL;
-static lv_obj_t *s_bt_title     = NULL;
-static lv_obj_t *s_bt_list      = NULL;
-static lv_obj_t *s_bt_card      = NULL;
-static lv_obj_t *s_bt_card_name = NULL;
-static lv_obj_t *s_bt_action_btn  = NULL;
-static lv_obj_t *s_bt_action_lbl  = NULL;
+/* 蓝牙面板控件句柄 */
+static lv_obj_t *s_bt_overlay   = NULL;  /* 全屏透明遮罩 (点外部关闭) */
+static lv_obj_t *s_bt_cont      = NULL;  /* 白色面板容器 */
+static lv_obj_t *s_bt_title     = NULL;  /* 标题 */
+static lv_obj_t *s_bt_list      = NULL;  /* 设备列表 */
+static lv_obj_t *s_bt_card      = NULL;  /* 已连/连接中卡片 */
+static lv_obj_t *s_bt_card_name = NULL;  /* 卡片设备名 */
+static lv_obj_t *s_bt_action_btn  = NULL;  /* 操作按钮 (断开/连接中) */
+static lv_obj_t *s_bt_action_lbl  = NULL;  /* 操作按钮文字 */
 
-static bool         s_bt_open = false;
-static bool         s_bt_scanning = false;
-static bt_state_t   s_bt_state = BT_STATE_DISCONNECTED;
-static char         s_bt_connect_name[32];
+static bool         s_bt_open = false;         /* 面板是否打开 */
+static bool         s_bt_scanning = false;     /* 是否正在扫描 */
+static bt_state_t   s_bt_state = BT_STATE_DISCONNECTED;   /* 影子连接状态 */
+static char         s_bt_connect_name[32];     /* 当前连接/连接中的设备名 */
 
-static char         s_bt_display[BT_BUF_MAX][32];
+static char         s_bt_display[BT_BUF_MAX][32];  /* 当前显示的设备名列表 */
 static int          s_bt_display_count = 0;
-static char         s_bt_pending[BT_BUF_MAX][32];
+static char         s_bt_pending[BT_BUF_MAX][32];  /* 扫描结果缓冲 (扫描完成一次性刷新) */
 static int          s_bt_pending_count = 0;
 
-static bt_a2dp_iface_t *s_bt_iface = NULL;
+static bt_a2dp_iface_t *s_bt_iface = NULL;   /* 蓝牙接口 */
 
+/* 发送蓝牙命令: type=命令, name=目标设备名(可空) */
 static void bt_send_cmd(bt_cmd_type_t type, const char *name)
 {
     if (!s_bt_iface) return;
@@ -57,10 +59,11 @@ static void bt_maybe_start_scan(void)
     bt_send_cmd(BT_CMD_SCAN, NULL);
 }
 
+/* 点击某设备行 → 发起连接 */
 static void bt_item_click_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
-    const char *name = (const char *)lv_obj_get_user_data(btn);
+    const char *name = (const char *)lv_obj_get_user_data(btn);   /* 设备名存在 user_data */
     if (!name) return;
 
     s_bt_scanning = false;
@@ -68,6 +71,7 @@ static void bt_item_click_cb(lv_event_t *e)
     bt_send_cmd(BT_CMD_CONNECT, name);
 }
 
+/* 操作按钮: 已连接 → 断开 */
 static void bt_action_click_cb(lv_event_t *e)
 {
     if (s_bt_state == BT_STATE_CONNECTED) {
@@ -75,6 +79,7 @@ static void bt_action_click_cb(lv_event_t *e)
     }
 }
 
+/* 切到"列表视图": 显示设备列表, 隐藏卡片 */
 static void bt_show_list_view(void)
 {
     lv_obj_clear_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
@@ -82,7 +87,8 @@ static void bt_show_list_view(void)
     lv_obj_add_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
 }
 
-/* 依据给定状态更新影子状态 + (列表打开时)渲染对应视图 */
+/* 依据给定状态更新影子状态 + (列表打开时)渲染对应视图.
+ * state=新状态, name=相关设备名 */
 static void bt_apply_state(bt_state_t state, const char *name)
 {
     s_bt_state = state;
@@ -91,16 +97,16 @@ static void bt_apply_state(bt_state_t state, const char *name)
         s_bt_connect_name[sizeof(s_bt_connect_name) - 1] = '\0';
     }
 
-    if (!s_bt_open) return;
+    if (!s_bt_open) return;   /* 面板没开就不渲染 */
 
     s_bt_scanning = false;
 
     switch (state) {
-    case BT_STATE_DISCONNECTED:
+    case BT_STATE_DISCONNECTED:   /* 未连接: 回列表, 重新扫描 */
         bt_show_list_view();
         bt_maybe_start_scan();
         break;
-    case BT_STATE_CONNECTING:
+    case BT_STATE_CONNECTING:   /* 连接中: 蓝色卡片 */
         lv_label_set_text(s_bt_card_name, s_bt_connect_name);
         lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_BLUE, 0);
         lv_label_set_text(s_bt_action_lbl, "Connecting");
@@ -108,7 +114,7 @@ static void bt_apply_state(bt_state_t state, const char *name)
         lv_obj_clear_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_bt_list, LV_OBJ_FLAG_HIDDEN);
         break;
-    case BT_STATE_CONNECTED:
+    case BT_STATE_CONNECTED:   /* 已连接: 蓝色卡片 + 红色断开按钮 */
         lv_label_set_text(s_bt_card_name, s_bt_connect_name);
         lv_obj_set_style_bg_color(s_bt_action_btn, COLOR_BT_RED, 0);
         lv_label_set_text(s_bt_action_lbl, "Disconnect");
@@ -121,11 +127,12 @@ static void bt_apply_state(bt_state_t state, const char *name)
     }
 }
 
+/* 重建设备列表 (清空重建, 每行一个按钮) */
 static void bt_refresh_list(void)
 {
     lv_obj_clean(s_bt_list);
 
-    if (s_bt_display_count == 0) {
+    if (s_bt_display_count == 0) {   /* 空: 显示提示 */
         lv_obj_t *btn = lv_list_add_btn(s_bt_list, NULL, "No devices");
         lv_obj_set_height(btn, BT_ROW_H);
         lv_obj_set_style_pad_all(btn, 0, 0);
@@ -136,7 +143,7 @@ static void bt_refresh_list(void)
         return;
     }
 
-    for (int i = 0; i < s_bt_display_count; i++) {
+    for (int i = 0; i < s_bt_display_count; i++) {   /* 每个设备一行 */
         lv_obj_t *btn = lv_list_add_btn(s_bt_list, NULL, s_bt_display[i]);
         lv_obj_set_height(btn, BT_ROW_H);
         lv_obj_set_style_pad_all(btn, 0, 0);
@@ -148,16 +155,18 @@ static void bt_refresh_list(void)
         lv_obj_set_style_text_color(label, lv_color_black(), 0);
         lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
 
-        lv_obj_set_user_data(btn, s_bt_display[i]);
+        lv_obj_set_user_data(btn, s_bt_display[i]);   /* 存设备名供点击回调 */
         lv_obj_add_event_cb(btn, bt_item_click_cb, LV_EVENT_CLICKED, NULL);
     }
 }
 
+/* 遮罩点击 → 关闭面板 (复用入口回调) */
 static void bt_overlay_click_cb(lv_event_t *e)
 {
     bt_menu_click_cb(e);
 }
 
+/* 实际打开面板: 创建所有控件 */
 static void bt_list_open(void)
 {
     if (s_bt_open) return;
@@ -166,6 +175,7 @@ static void bt_list_open(void)
     s_bt_pending_count = 0;
     s_bt_display_count = 0;
 
+    /* 全屏透明遮罩按钮 */
     s_bt_overlay = lv_btn_create(lv_scr_act());
     lv_obj_set_size(s_bt_overlay, 172, 320);
     lv_obj_set_pos(s_bt_overlay, 0, 0);
@@ -175,6 +185,7 @@ static void bt_list_open(void)
     lv_obj_add_event_cb(s_bt_overlay, bt_overlay_click_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_clear_flag(s_bt_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 白色面板容器 */
     s_bt_cont = lv_obj_create(s_bt_overlay);
     lv_obj_set_pos(s_bt_cont, BT_X, BT_Y);
     lv_obj_set_size(s_bt_cont, BT_W, BT_H);
@@ -186,6 +197,7 @@ static void bt_list_open(void)
     lv_obj_set_style_pad_all(s_bt_cont, 0, 0);
     lv_obj_clear_flag(s_bt_cont, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 标题 */
     s_bt_title = lv_label_create(s_bt_cont);
     lv_obj_set_pos(s_bt_title, 6, 4);
     lv_obj_set_size(s_bt_title, BT_W - 12, 22);
@@ -194,6 +206,7 @@ static void bt_list_open(void)
     lv_label_set_long_mode(s_bt_title, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_bt_title, "Bluetooth");
 
+    /* 设备列表 */
     s_bt_list = lv_list_create(s_bt_cont);
     lv_obj_set_pos(s_bt_list, 0, 28);
     lv_obj_set_size(s_bt_list, BT_W, BT_H - 28);
@@ -203,6 +216,7 @@ static void bt_list_open(void)
     lv_obj_set_style_pad_all(s_bt_list, 0, 0);
     lv_obj_set_style_pad_top(s_bt_list, 8, 0);
 
+    /* 连接状态卡片 */
     s_bt_card = lv_obj_create(s_bt_cont);
     lv_obj_set_pos(s_bt_card, 12, 40);
     lv_obj_set_size(s_bt_card, BT_W - 24, 72);
@@ -221,6 +235,7 @@ static void bt_list_open(void)
     lv_label_set_text(s_bt_card_name, "");
     lv_obj_align(s_bt_card_name, LV_ALIGN_CENTER, 0, 0);
 
+    /* 底部操作按钮 (连接中/断开) */
     s_bt_action_btn = lv_btn_create(s_bt_cont);
     lv_obj_set_pos(s_bt_action_btn, 12, BT_H - 48);
     lv_obj_set_size(s_bt_action_btn, BT_W - 24, 36);
@@ -237,18 +252,20 @@ static void bt_list_open(void)
     lv_obj_set_style_text_color(s_bt_action_lbl, lv_color_white(), 0);
     lv_obj_center(s_bt_action_lbl);
 
+    /* 初始隐藏卡片/按钮, 显示列表 */
     lv_obj_add_flag(s_bt_card, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_bt_action_btn, LV_OBJ_FLAG_HIDDEN);
 
     bt_apply_state(s_bt_state, NULL);
-    bt_send_cmd(BT_CMD_GET_STATE, NULL);
+    bt_send_cmd(BT_CMD_GET_STATE, NULL);   /* 拉取最新状态 */
 }
 
+/* 实际关闭面板: 停止扫描 + 删除全部控件 */
 static void bt_list_close(void)
 {
     if (!s_bt_open) return;
 
-    if (s_bt_scanning) {
+    if (s_bt_scanning) {   /* 若在扫描则先停止 */
         bt_send_cmd(BT_CMD_STOP_SCAN, NULL);
     }
 
@@ -256,7 +273,7 @@ static void bt_list_close(void)
     s_bt_open = false;
 
     if (s_bt_overlay) {
-        lv_obj_del(s_bt_overlay);
+        lv_obj_del(s_bt_overlay);   /* 删除遮罩会连带删除全部子控件 */
     }
     s_bt_overlay   = NULL;
     s_bt_cont      = NULL;
@@ -268,11 +285,13 @@ static void bt_list_close(void)
     s_bt_action_lbl  = NULL;
 }
 
+/* 初始化蓝牙列表: 保存接口 */
 void bt_list_init(bt_a2dp_iface_t *iface)
 {
     s_bt_iface = iface;
 }
 
+/* 蓝牙菜单入口点击: 开/关面板 (带开合动画) */
 void bt_menu_click_cb(lv_event_t *e)
 {
     if (s_bt_open) {
@@ -300,6 +319,7 @@ void bt_menu_click_cb(lv_event_t *e)
     }
 }
 
+/* 扫描到设备 (面板开着才收, 先存 pending 缓冲) */
 void bt_list_on_device_found(const char *name)
 {
     if (!s_bt_open) return;
@@ -309,12 +329,13 @@ void bt_list_on_device_found(const char *name)
     s_bt_pending_count++;
 }
 
+/* 扫描完成: pending → display, 重建列表 */
 void bt_list_on_scan_done(void)
 {
     if (!s_bt_open) return;
     s_bt_scanning = false;
 
-    s_bt_display_count = s_bt_pending_count;
+    s_bt_display_count = s_bt_pending_count;   /* 拷贝结果 */
     for (int i = 0; i < s_bt_pending_count; i++) {
         size_t plen = strnlen(s_bt_pending[i], sizeof(s_bt_display[0]) - 1);
         memcpy(s_bt_display[i], s_bt_pending[i], plen);
@@ -324,7 +345,7 @@ void bt_list_on_scan_done(void)
 
     bt_refresh_list();
 
-    bt_maybe_start_scan();
+    bt_maybe_start_scan();   /* 若列表空可再扫一轮 */
 }
 
 void bt_list_on_connected(const char *name)

@@ -21,8 +21,8 @@
  */
 
 typedef struct resampler_fxp_s {
-    uint32_t  src_rate;
-    uint8_t   channels;
+    uint32_t  src_rate;    /* 源采样率 */
+    uint8_t   channels;    /* 声道数 1/2 */
     int32_t   taps;        /* 每相位抽头数 (16 或 32, 2 的幂) */
     int32_t   half;        /* taps/2 */
     int32_t   p, q;        /* 比率 p/q = 44100/有效采样率 (约分后) */
@@ -35,6 +35,7 @@ typedef struct resampler_fxp_s {
     int16_t   rowbuf[32];  /* 当前相位系数行 staging (内部 RAM, 避免逐抽头 PSRAM 缺失) */
 } resampler_fxp_t;
 
+/* 最大公约数 */
 static int32_t gcd_int(int32_t a, int32_t b)
 {
     while (b) {
@@ -50,6 +51,8 @@ resampler_fxp_t *resampler_fxp_create(void)
     return (resampler_fxp_t *)calloc(1, sizeof(resampler_fxp_t));
 }
 
+/* 配置重采样器: src_rate=源采样率, channels=声道数.
+ * 在 PSRAM 生成 [p 相位 × taps 抽头] 的 sinc 低通系数. */
 bool resampler_fxp_open(resampler_fxp_t *r, uint32_t src_rate, uint8_t channels)
 {
     if (!r || src_rate == 0 || (channels != 1 && channels != 2)) return false;
@@ -87,11 +90,12 @@ bool resampler_fxp_open(resampler_fxp_t *r, uint32_t src_rate, uint8_t channels)
     if (p < q) fc = (double)p / (2.0 * q);
 
     int16_t *coeff = (int16_t *)heap_caps_malloc((size_t)p * taps * sizeof(int16_t),
-                                                 MALLOC_CAP_SPIRAM);
+                                                 MALLOC_CAP_SPIRAM);   /* 系数表放 PSRAM */
     if (!coeff) return false;
 
+    /* 生成每个相位的窗函数化 sinc 系数 (先求总和做 DC 归一化) */
     for (int32_t ph = 0; ph < p; ph++) {
-        double frac = (double)ph / p;
+        double frac = (double)ph / p;   /* 该相位相对位置 0..1 */
         double sum = 0.0;
         int16_t *row = coeff + (size_t)ph * taps;
 
@@ -99,12 +103,12 @@ bool resampler_fxp_open(resampler_fxp_t *r, uint32_t src_rate, uint8_t channels)
             double u = frac + (double)(j - half + 1);
             double s;
             if (u == 0.0) {
-                s = 1.0;
+                s = 1.0;   /* sinc(0) */
             } else {
                 double x = 2.0 * M_PI * fc * u;
-                s = sin(x) / x;
+                s = sin(x) / x;   /* 理想低通冲激响应 */
             }
-            double w = 0.5 + 0.5 * cos(M_PI * u / half);
+            double w = 0.5 + 0.5 * cos(M_PI * u / half);   /* 汉宁窗 */
             sum += s * w;
         }
 
@@ -120,7 +124,7 @@ bool resampler_fxp_open(resampler_fxp_t *r, uint32_t src_rate, uint8_t channels)
                 s = sin(x) / x;
             }
             double w = 0.5 + 0.5 * cos(M_PI * u / half);
-            long v = lrint(s * w / sum * 16384.0);
+            long v = lrint(s * w / sum * 16384.0);   /* 归一化到 Q14 */
             if (v > 16384) v = 16384;
             if (v < -16384) v = -16384;
             row[j] = (int16_t)v;
@@ -142,6 +146,9 @@ bool resampler_fxp_open(resampler_fxp_t *r, uint32_t src_rate, uint8_t channels)
     return true;
 }
 
+/* 重采样一块输入到输出.
+ * src=交错 int16 输入, src_frames=输入帧数, dst=输出缓冲, dst_cap_frames=输出容量(帧).
+ * 返回实际输出帧数. */
 size_t resampler_fxp_process(resampler_fxp_t *r, const int16_t *src, size_t src_frames,
                              int16_t *dst, size_t dst_cap_frames)
 {
@@ -149,7 +156,7 @@ size_t resampler_fxp_process(resampler_fxp_t *r, const int16_t *src, size_t src_
 
     const int32_t taps = r->taps;
     const int32_t half = r->half;
-    const int32_t mask = taps - 1;      /* taps 为 2 的幂 */
+    const int32_t mask = taps - 1;      /* taps 为 2 的幂 → 位与即取模 */
     const int32_t ch   = r->channels;
     const int32_t p    = r->p;
     const int32_t q    = r->q;
@@ -159,15 +166,15 @@ size_t resampler_fxp_process(resampler_fxp_t *r, const int16_t *src, size_t src_
     while (out_frames < dst_cap_frames && src_frames >= r->decim) {
         /* 确保历史缓冲里有 [ipos-half, ipos+half-1]; 每存 1 个样本消耗 decim 个输入帧 */
         while (r->ipos + half - 1 >= r->in_next && src_frames >= r->decim) {
-            const int16_t *p = src + (r->decim - 1) * ch;
+            const int16_t *p = src + (r->decim - 1) * ch;   /* 降采样取第 decim 帧 */
             for (int32_t c = 0; c < ch; c++) {
-                r->hist[c][r->in_next & mask] = p[c];
+                r->hist[c][r->in_next & mask] = p[c];   /* 写入环形历史 */
             }
             src += r->decim * ch;
             src_frames -= r->decim;
             r->in_next++;
         }
-        if (r->ipos + half - 1 >= r->in_next) break;
+        if (r->ipos + half - 1 >= r->in_next) break;   /* 输入不足, 等待下块 */
 
         /* 产生一帧输出: 先把当前相位系数行拷贝到内部 rowbuf,
          * 避免 16 抽头循环逐次读 PSRAM (缓存缺失 ~40 周期/次) */
@@ -177,11 +184,11 @@ size_t resampler_fxp_process(resampler_fxp_t *r, const int16_t *src, size_t src_
         for (int32_t c = 0; c < ch; c++) {
             const int16_t *hp = r->hist[c];
             int32_t acc = 0;   /* Q14: int32 累加, 不溢出 (见 open 注释) */
-            for (int32_t j = 0; j < taps; j++) {
+            for (int32_t j = 0; j < taps; j++) {   /* polyphase 点积 */
                 int32_t a = j - half + 1;
                 acc += (int32_t)hp[(r->ipos - a) & mask] * rb[j];
             }
-            *out++ = (int16_t)((acc + 8192) >> 14);
+            *out++ = (int16_t)((acc + 8192) >> 14);   /* 舍入到 Q14 再右移回 int16 */
         }
         out_frames++;
 
@@ -189,7 +196,7 @@ size_t resampler_fxp_process(resampler_fxp_t *r, const int16_t *src, size_t src_
         r->pos += q;
         while (r->pos >= p) {
             r->pos -= p;
-            r->ipos++;
+            r->ipos++;   /* 每累计满一个相位周期, 输入位置前进 1 样本 */
         }
     }
 

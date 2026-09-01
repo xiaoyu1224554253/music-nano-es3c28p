@@ -16,16 +16,19 @@ static const char *TAG = "drv_display";
 static void lcd_backlight_init(void);
 
 /* ────────────────────────── LCD (JD9853) ────────────────────────── */
-#define PIN_LCD_SCLK  18
-#define PIN_LCD_MOSI  23
-#define PIN_LCD_CS     5
-#define PIN_LCD_DC    32
-#define PIN_LCD_RST   33
-#define PIN_LCD_BL     4
+/* SPI/控制引脚定义 */
+#define PIN_LCD_SCLK  18   /* SPI 时钟 */
+#define PIN_LCD_MOSI  23   /* SPI 数据输出 (写命令/像素) */
+#define PIN_LCD_CS     5   /* 片选 (低有效) */
+#define PIN_LCD_DC    32   /* 数据/命令选择: 高=数据, 低=命令 */
+#define PIN_LCD_RST   33   /* 复位 (低有效, 实际由 bootloader 操作) */
+#define PIN_LCD_BL     4   /* 背光 PWM 引脚 */
 
-#define LCD_H_RES  172
-#define LCD_V_RES  320
+#define LCD_H_RES  172   /* 屏水平分辨率 (像素) */
+#define LCD_V_RES  320   /* 屏垂直分辨率 (像素) */
 
+/* JD9853 上电初始化寄存器序列 (厂家推荐值, 由 esp_lcd_jd9853 组件执行):
+ * 每项 = {命令码, 参数数组, 参数个数, 等待ms} */
 static const jd9853_lcd_init_cmd_t init_cmds[] = {
     {0xDF, (uint8_t[]){0x98, 0x53}, 2, 0},
     {0xDF, (uint8_t[]){0x98, 0x53}, 2, 0},
@@ -61,50 +64,51 @@ static const jd9853_lcd_init_cmd_t init_cmds[] = {
     {0x29, (uint8_t []){ 0x00 }, 0, 0},
 };
 
-static esp_lcd_panel_io_handle_t s_panel_io = NULL;
-static esp_lcd_panel_handle_t s_panel = NULL;
-static int64_t s_slpo_us = 0;
+static esp_lcd_panel_io_handle_t s_panel_io = NULL;   /* LCD 面板 IO 句柄 (SPI 读写通道) */
+static esp_lcd_panel_handle_t s_panel = NULL;         /* LCD 面板句柄 */
+static int64_t s_slpo_us = 0;                         /* SLPOUT 命令发出的时刻 (us), 用于计时 */
 
-#define LCD_SLEEP_OUT_MS  120
+#define LCD_SLEEP_OUT_MS  120   /* 退出休眠后需等待的稳定时间 */
 
-/* 前半段 (app_main 头部): 建 SPI/IO/面板 + 发 SLPOUT (记时刻). 
+/* 前半段 (app_main 头部): 建 SPI/IO/面板 + 发 SLPOUT (记时刻).
  * 硬件复位由 bootloader 完成, 不再调用 esp_lcd_panel_reset.
- * 非阻塞: SLPOUT 后的 120ms 由启动/UI 构建时间自然覆盖, 后半段检查补齐. */
+ * 非阻塞: SLPOUT 后的 120ms 由启动/UI 构建时间自然覆盖, 后半段检查补齐.
+ * host: SPI 外设编号 (SPI2_HOST/SPI3_HOST). 返回面板句柄. */
 esp_lcd_panel_handle_t lcd_init_early(spi_host_device_t host)
 {
-    /* SPI bus */
+    /* SPI bus: 配置 SCLK/MOSI, 其余脚不用则 -1 */
     spi_bus_config_t buscfg = {
         .sclk_io_num     = PIN_LCD_SCLK,
         .mosi_io_num     = PIN_LCD_MOSI,
-        .miso_io_num     = -1,
-        .quadwp_io_num   = -1,
-        .quadhd_io_num   = -1,
-        .max_transfer_sz = LCD_H_RES * LCD_V_RES * 2,
+        .miso_io_num     = -1,                                   /* LCD 只写, 不接 MISO */
+        .quadwp_io_num   = -1,                                   /* 不用 QSPI 的 WP 脚 */
+        .quadhd_io_num   = -1,                                   /* 不用 QSPI 的 HD 脚 */
+        .max_transfer_sz = LCD_H_RES * LCD_V_RES * 2,            /* 最大传输: 整屏 16bit 像素 */
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(host, &buscfg, SPI_DMA_CH_AUTO));
+    ESP_ERROR_CHECK(spi_bus_initialize(host, &buscfg, SPI_DMA_CH_AUTO));   /* 自动分配 DMA 通道 */
 
-    /* Panel IO */
+    /* Panel IO: 定义 SPI 协议层的命令/数据线时序 */
     esp_lcd_panel_io_spi_config_t io_config = {
         .cs_gpio_num       = PIN_LCD_CS,
         .dc_gpio_num       = PIN_LCD_DC,
-        .spi_mode          = 0,
-        .pclk_hz           = 80 * 1000 * 1000,
-        .trans_queue_depth = 1,
-        .lcd_cmd_bits      = 8,
-        .lcd_param_bits    = 8,
+        .spi_mode          = 0,                  /* SPI mode 0 (CPOL=0, CPHA=0) */
+        .pclk_hz           = 80 * 1000 * 1000,   /* SPI 时钟 80MHz */
+        .trans_queue_depth = 1,                  /* 事务队列深度 */
+        .lcd_cmd_bits      = 8,                  /* 命令字长 8bit */
+        .lcd_param_bits    = 8,                  /* 参数字长 8bit */
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)host,
                                               &io_config, &s_panel_io));
 
-    /* Panel */
+    /* Panel: 绑定 JD9853 驱动, 附带寄存器初始化序列 */
     jd9853_vendor_config_t vendor_cfg = {
         .init_cmds      = init_cmds,
         .init_cmds_size = sizeof(init_cmds) / sizeof(jd9853_lcd_init_cmd_t),
     };
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = PIN_LCD_RST,
-        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = 16,
+        .reset_gpio_num = PIN_LCD_RST,          /* 复位引脚 (bootloader 已释放, 仅声明) */
+        .rgb_ele_order  = LCD_RGB_ELEMENT_ORDER_RGB,   /* 像素通道顺序 RGB */
+        .bits_per_pixel = 16,                   /* RGB565 */
         .vendor_config  = &vendor_cfg,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_jd9853(s_panel_io, &panel_config, &s_panel));
@@ -123,16 +127,17 @@ esp_lcd_panel_handle_t lcd_init_early(spi_host_device_t host)
 /* 后半段 (lvgl 任务, 无限循环前): 距 SLPOUT ≥120ms 后发寄存器命令 + DISPON */
 esp_lcd_panel_handle_t lcd_init_finish(void)
 {
+    /* 若前半段流逝时间不足 120ms, 这里补足 */
     int64_t remain_us = LCD_SLEEP_OUT_MS * 1000 - (esp_timer_get_time() - s_slpo_us);
     if (remain_us > 0) {
         vTaskDelay(pdMS_TO_TICKS((remain_us + 999) / 1000));
     }
 
-    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
-    esp_lcd_panel_set_gap(s_panel, 34, 0);
-    esp_lcd_panel_mirror(s_panel, true, true);
-    esp_lcd_panel_invert_color(s_panel, true);
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));              /* 执行寄存器初始化序列 */
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true)); /* DISPON 点亮 */
+    esp_lcd_panel_set_gap(s_panel, 34, 0);                     /* 面板横向起始偏移 34 (驱动 IC 列寻址偏移) */
+    esp_lcd_panel_mirror(s_panel, true, true);                 /* 水平+垂直镜像, 匹配安装方向 */
+    esp_lcd_panel_invert_color(s_panel, true);                 /* 颜色反相 (该面板需要) */
 
     ESP_LOGI(TAG, "LCD init done (%dx%d), gap=(34,0)", LCD_H_RES, LCD_V_RES);
     return s_panel;
@@ -145,7 +150,7 @@ esp_lcd_panel_handle_t lcd_get_panel(void)
 }
 
 /* ────────────────────────── Backlight (LEDC PWM) ────────────────────────── */
-#define BL_PWM_FREQ_HZ  5000
+#define BL_PWM_FREQ_HZ  5000   /* 背光 PWM 频率 5kHz (高于人耳可闻, 避免电感啸叫) */
 
 /* 亮度感知曲线 (γ=2.2 对数映射): 滑块值 0~255 → LEDC 占空比.
  * 人眼感知近似对数, 线性占空比在低亮度段变化过快, 查表补偿.
@@ -169,14 +174,15 @@ static const uint8_t s_brightness_lut[256] = {
     223, 225, 227, 229, 231, 234, 236, 238, 240, 242, 244, 246, 248, 251, 253, 255,
 };
 
+/* 背光 PWM 初始化: 配置 LEDC 定时器 + 通道, 初始占空比 0 (不开屏) */
 static void lcd_backlight_init(void)
 {
     ledc_timer_config_t timer_cfg = {
-        .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_8_BIT,
+        .speed_mode      = LEDC_LOW_SPEED_MODE,   /* 低速模式 (ESP32 上 CH0~7) */
+        .duty_resolution = LEDC_TIMER_8_BIT,      /* 8bit 分辨率, 占空比 0~255 */
         .timer_num       = LEDC_TIMER_0,
         .freq_hz         = BL_PWM_FREQ_HZ,
-        .clk_cfg         = LEDC_AUTO_CLK,
+        .clk_cfg         = LEDC_AUTO_CLK,         /* 自动选时钟源 */
     };
     ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
 
@@ -184,17 +190,18 @@ static void lcd_backlight_init(void)
         .gpio_num   = PIN_LCD_BL,
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel    = LEDC_CHANNEL_0,
-        .intr_type  = LEDC_INTR_DISABLE,
+        .intr_type  = LEDC_INTR_DISABLE,          /* 不需要中断 */
         .timer_sel  = LEDC_TIMER_0,
-        .duty       = 0,
-        .hpoint     = 0,
+        .duty       = 0,                          /* 初始全灭 */
+        .hpoint     = 0,                          /* PWM 相位起点 */
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
 }
 
+/* 设定背光亮度: level=亮度值 0~255, 经 γ 曲线查表后写 LEDC 占空比 */
 void lcd_set_brightness(uint8_t level)
 {
-    uint8_t duty = s_brightness_lut[level];
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    uint8_t duty = s_brightness_lut[level];       /* 感知线性化映射 */
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);   /* 更新目标占空比 */
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);      /* 使占空比实际生效 */
 }

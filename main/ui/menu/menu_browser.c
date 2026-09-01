@@ -8,31 +8,32 @@
 
 extern const lv_font_t lv_font_global_16;
 
-#define FS_W        135
-#define FS_H        220
-#define FS_X        0
-#define FS_Y        3
-#define FS_ITEMS    30
-#define FS_ROW_H    18
+#define FS_W        135    /* 面板宽 */
+#define FS_H        220    /* 面板高 */
+#define FS_X        0      /* 面板 X (从左上角展开) */
+#define FS_Y        3      /* 面板 Y */
+#define FS_ITEMS    30     /* 每页条目数 */
+#define FS_ROW_H    18     /* 行高 (实际运行时覆盖为 30) */
 
-static lv_obj_t  *s_fs_overlay   = NULL;
-static lv_obj_t  *s_fs_cont      = NULL;
-static lv_obj_t  *s_fs_title     = NULL;
-static lv_obj_t  *s_fs_list      = NULL;
-static lv_obj_t  *s_fs_page_lbl  = NULL;
-static lv_obj_t  *s_fs_prev_btn  = NULL;
-static lv_obj_t  *s_fs_next_btn  = NULL;
+/* 文件浏览器控件句柄 */
+static lv_obj_t  *s_fs_overlay   = NULL;  /* 全屏透明遮罩 */
+static lv_obj_t  *s_fs_cont      = NULL;  /* 白色面板容器 */
+static lv_obj_t  *s_fs_title     = NULL;  /* 标题 */
+static lv_obj_t  *s_fs_list      = NULL;  /* 文件列表 */
+static lv_obj_t  *s_fs_page_lbl  = NULL;  /* 页码标签 */
+static lv_obj_t  *s_fs_prev_btn  = NULL;  /* 上一页按钮 */
+static lv_obj_t  *s_fs_next_btn  = NULL;  /* 下一页按钮 */
 
-static int   s_fs_page            = 0;
-static int   s_fs_total           = 0;
-static bool  s_fs_inside          = false;
-static const char *s_fs_group    = NULL;
+static int   s_fs_page            = 0;     /* 当前页 */
+static int   s_fs_total           = 0;     /* 总页数 */
+static bool  s_fs_inside          = false; /* 是否已进入子目录 */
+static const char *s_fs_group    = NULL;   /* 当前分组 (sdcard 或 sdcard_xxx) */
 static lv_obj_t *s_fs_current_btn = NULL; /* 当前播放歌曲对应的列表行按钮 */
 
-static lv_img_dsc_t s_fs_icon_dir;
-static lv_img_dsc_t s_fs_icon_music;
+static lv_img_dsc_t s_fs_icon_dir;    /* 文件夹图标 */
+static lv_img_dsc_t s_fs_icon_music;  /* 音乐文件图标 */
 
-static void (*s_play_cb)(const char *group, const char *name) = NULL;
+static void (*s_play_cb)(const char *group, const char *name) = NULL;   /* 点击播放回调 */
 
 static void fs_browser_open(void);
 static void fs_browser_close(void);
@@ -41,11 +42,13 @@ static void fs_browser_enter_dir(const char *cache_name);
 static void fs_browser_go_back(void);
 static void fs_browser_jump_to_current(void);
 
+/* 注册点击播放回调: cb=播放函数 */
 void fs_list_set_play_cb(void (*cb)(const char *group, const char *name))
 {
     s_play_cb = cb;
 }
 
+/* 统计指定分组的条目数 */
 static int fs_cache_count_for_group(const char *group)
 {
     if (!g_fs_cache || !group) return 0;
@@ -56,6 +59,7 @@ static int fs_cache_count_for_group(const char *group)
     return count;
 }
 
+/* 取分组内第 idx 个缓存条目 */
 static fs_entry_t *fs_cache_entry_for_group(const char *group, int idx)
 {
     if (!g_fs_cache || !group) return NULL;
@@ -69,14 +73,15 @@ static fs_entry_t *fs_cache_entry_for_group(const char *group, int idx)
     return NULL;
 }
 
+/* 列表项点击: 目录→进入, 文件→播放 */
 static void fs_item_click_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
-    fs_entry_t *entry = (fs_entry_t *)lv_obj_get_user_data(btn);
+    fs_entry_t *entry = (fs_entry_t *)lv_obj_get_user_data(btn);   /* 条目存 user_data */
     if (!entry) return;
 
     if (entry->is_dir) {
-        fs_browser_enter_dir(entry->name);
+        fs_browser_enter_dir(entry->name);   /* 进入子目录 */
     } else if (s_play_cb) {
         /* 播放切换后由 fs_browser_refresh() 统一重绘, 让绿色高亮跟随新播放的歌曲 */
         s_play_cb(s_fs_group, entry->name);
@@ -108,6 +113,7 @@ static bool fs_entry_is_current(fs_entry_t *entry)
     return false;
 }
 
+/* 向列表添加一个条目 (带图标), 若为当前播放歌曲则绿色高亮 */
 static void fs_add_item(fs_entry_t *entry)
 {
     lv_img_dsc_t *icon = entry->is_dir ? &s_fs_icon_dir : &s_fs_icon_music;
@@ -123,33 +129,35 @@ static void fs_add_item(fs_entry_t *entry)
     lv_obj_set_height(label, lv_font_get_line_height(&lv_font_global_16));
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
 
-    lv_obj_set_user_data(btn, entry);
+    lv_obj_set_user_data(btn, entry);   /* 存条目指针供点击回调 */
     lv_obj_add_event_cb(btn, fs_item_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* 高亮当前正在播放的歌曲行 */
     if (fs_entry_is_current(entry)) {
         s_fs_current_btn = btn;
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0xB7F7C2), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xB7F7C2), 0);   /* 淡绿高亮 */
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     }
 }
 
+/* 显示指定页: 计算页数/页码, 重建列表行 */
 static void fs_browser_show_page(int page)
 {
     s_fs_page = page;
     s_fs_current_btn = NULL;
 
     int total = fs_cache_count_for_group(s_fs_group);
-    s_fs_total = (total + FS_ITEMS - 1) / FS_ITEMS;
+    s_fs_total = (total + FS_ITEMS - 1) / FS_ITEMS;   /* 总页数 (向上取整) */
     if (s_fs_total < 1) s_fs_total = 1;
 
-    int start = page * FS_ITEMS;
+    int start = page * FS_ITEMS;   /* 本页首条目 */
     int end   = (start + FS_ITEMS) < total ? (start + FS_ITEMS) : total;
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "%d/%d", page + 1, s_fs_total);
+    snprintf(buf, sizeof(buf), "%d/%d", page + 1, s_fs_total);   /* 页码 */
     lv_label_set_text(s_fs_page_lbl, buf);
 
+    /* 首页/末页禁用对应翻页按钮 */
     if (page <= 0) {
         lv_obj_add_state(s_fs_prev_btn, LV_STATE_DISABLED);
     } else {
@@ -161,9 +169,9 @@ static void fs_browser_show_page(int page)
         lv_obj_clear_state(s_fs_next_btn, LV_STATE_DISABLED);
     }
 
-    lv_obj_clean(s_fs_list);
+    lv_obj_clean(s_fs_list);   /* 清空重建 */
 
-    if (total == 0) {
+    if (total == 0) {   /* 空目录提示 */
         lv_obj_t *btn = lv_list_add_btn(s_fs_list, NULL, "无文件");
         lv_obj_set_height(btn, 30);
         lv_obj_set_style_pad_all(btn, 0, 0);
@@ -174,12 +182,13 @@ static void fs_browser_show_page(int page)
         return;
     }
 
-    for (int i = start; i < end; i++) {
+    for (int i = start; i < end; i++) {   /* 填充本页条目 */
         fs_entry_t *entry = fs_cache_entry_for_group(s_fs_group, i);
         if (entry) fs_add_item(entry);
     }
 }
 
+/* 上一页 */
 static void fs_prev_click_cb(lv_event_t *e)
 {
     if (s_fs_page > 0) {
@@ -187,6 +196,7 @@ static void fs_prev_click_cb(lv_event_t *e)
     }
 }
 
+/* 下一页 */
 static void fs_next_click_cb(lv_event_t *e)
 {
     if (s_fs_page < s_fs_total - 1) {
@@ -194,6 +204,7 @@ static void fs_next_click_cb(lv_event_t *e)
     }
 }
 
+/* 实际关闭浏览器: 删除遮罩 (连带删除子控件) 并复位状态 */
 static void fs_browser_close(void)
 {
     if (s_fs_overlay) {
@@ -230,14 +241,15 @@ static void fs_browser_enter_dir(const char *cache_name)
     s_fs_inside = true;
 
     static char group_buf[FS_GROUP_MAX];
-    snprintf(group_buf, sizeof(group_buf), "sdcard_%s", cache_name);
+    snprintf(group_buf, sizeof(group_buf), "sdcard_%s", cache_name);   /* 组名 = sdcard_子目录 */
     s_fs_group = group_buf;
 
-    lv_label_set_text(s_fs_title, cache_name);
+    lv_label_set_text(s_fs_title, cache_name);   /* 标题 = 目录名 */
 
     fs_browser_show_page(0);
 }
 
+/* 返回根目录 */
 static void fs_browser_go_back(void)
 {
     s_fs_inside = false;
@@ -247,16 +259,19 @@ static void fs_browser_go_back(void)
     fs_browser_show_page(0);
 }
 
+/* 返回按钮 */
 static void fs_back_click_cb(lv_event_t *e)
 {
     fs_browser_go_back();
 }
 
+/* 实际打开浏览器: 创建控件 + 加载根目录列表 */
 static void fs_browser_open(void)
 {
     if (s_fs_overlay) {
         fs_browser_close();
     }
+    /* 加载文件夹/音乐图标 */
     s_fs_icon_dir.header.w = 16;
     s_fs_icon_dir.header.h = 21;
     s_fs_icon_dir.data_size = 16 * 21 * 2;
@@ -268,6 +283,7 @@ static void fs_browser_open(void)
     s_fs_icon_music.header.cf = LV_IMG_CF_TRUE_COLOR;
     s_fs_icon_music.data = (const uint8_t *)icon_file[1];
 
+    /* 全屏透明遮罩 */
     s_fs_overlay = lv_btn_create(lv_scr_act());
     lv_obj_set_size(s_fs_overlay, 172, 320);
     lv_obj_set_pos(s_fs_overlay, 0, 0);
@@ -277,6 +293,7 @@ static void fs_browser_open(void)
     lv_obj_add_event_cb(s_fs_overlay, fs_overlay_click_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_clear_flag(s_fs_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 白色面板容器 */
     s_fs_cont = lv_obj_create(s_fs_overlay);
     lv_obj_set_pos(s_fs_cont, FS_X, FS_Y);
     lv_obj_set_size(s_fs_cont, FS_W, FS_H);
@@ -288,6 +305,7 @@ static void fs_browser_open(void)
     lv_obj_set_style_pad_all(s_fs_cont, 0, 0);
     lv_obj_clear_flag(s_fs_cont, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 标题 */
     s_fs_title = lv_label_create(s_fs_cont);
     lv_obj_set_pos(s_fs_title, 4, 0);
     lv_obj_set_size(s_fs_title, FS_W - 40, 22);
@@ -296,6 +314,7 @@ static void fs_browser_open(void)
     lv_label_set_long_mode(s_fs_title, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_fs_title, "Music Files");
 
+    /* 返回(上一级)按钮 */
     lv_obj_t *back_btn = lv_btn_create(s_fs_cont);
     lv_obj_set_pos(back_btn, FS_W - 36, 1);
     lv_obj_set_size(back_btn, 34, 16);
@@ -311,6 +330,7 @@ static void fs_browser_open(void)
     lv_obj_set_style_text_color(back_lbl, lv_color_hex(0x0000FF), 0);
     lv_obj_center(back_lbl);
 
+    /* 文件列表 */
     s_fs_list = lv_list_create(s_fs_cont);
     lv_obj_set_pos(s_fs_list, 0, 22);
     /* 修改列表高度：原为 FS_H - 36，现减少高度以为大按钮腾出空间 */
@@ -321,15 +341,14 @@ static void fs_browser_open(void)
     lv_obj_set_style_border_width(s_fs_list, 0, 0);
     lv_obj_set_style_pad_all(s_fs_list, 0, 0);
 
-    /* 修改导航区域 Y 坐标，向上移动 */
+    /* 底部导航区 Y */
     int nav_y = FS_H - 35;
 
+    /* 上一页按钮 */
     s_fs_prev_btn = lv_btn_create(s_fs_cont);
     lv_obj_set_pos(s_fs_prev_btn, 2, nav_y);
-    /* 修改按钮大小：变大变高 (40x32) */
     lv_obj_set_size(s_fs_prev_btn, 40, 32);
     lv_obj_set_style_radius(s_fs_prev_btn, 6, 0);
-    /* 修改按钮颜色：变为浅灰色，更深 */
     lv_obj_set_style_bg_color(s_fs_prev_btn, lv_color_hex(0xE0E0E0), 0);
     lv_obj_set_style_bg_opa(s_fs_prev_btn, LV_OPA_COVER, 0);
     lv_obj_set_style_shadow_width(s_fs_prev_btn, 0, 0);
@@ -338,27 +357,23 @@ static void fs_browser_open(void)
     lv_obj_t *prev_lbl = lv_label_create(s_fs_prev_btn);
     lv_label_set_text(prev_lbl, "<");
     lv_obj_set_style_text_font(prev_lbl, &lv_font_global_16, 0);
-    /* 文字颜色也设为蓝色，更协调 */
     lv_obj_set_style_text_color(prev_lbl, lv_color_hex(0x0000FF), 0);
     lv_obj_center(prev_lbl);
 
+    /* 页码标签 */
     s_fs_page_lbl = lv_label_create(s_fs_cont);
-    /* 调整页码标签位置，使其在新的空间内居中 */
-    /* 按钮宽40，总宽135。间隙约 (135-40-40)/3 = 18.3 */
     lv_obj_set_pos(s_fs_page_lbl, 47, nav_y + 8);
-    lv_obj_set_size(s_fs_page_lbl, 40, 16); /* 稍微变窄以适应新布局 */
+    lv_obj_set_size(s_fs_page_lbl, 40, 16);
     lv_obj_set_style_text_align(s_fs_page_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(s_fs_page_lbl, &lv_font_global_16, 0);
     lv_obj_set_style_text_color(s_fs_page_lbl, lv_color_black(), 0);
     lv_label_set_text(s_fs_page_lbl, "1/1");
 
+    /* 下一页按钮 */
     s_fs_next_btn = lv_btn_create(s_fs_cont);
-    /* 调整 X 坐标，靠右对齐 */
     lv_obj_set_pos(s_fs_next_btn, FS_W - 42, nav_y);
-    /* 修改按钮大小：变大变高 (40x32) */
     lv_obj_set_size(s_fs_next_btn, 40, 32);
     lv_obj_set_style_radius(s_fs_next_btn, 6, 0);
-    /* 修改按钮颜色：变为浅灰色，更深 */
     lv_obj_set_style_bg_color(s_fs_next_btn, lv_color_hex(0xE0E0E0), 0);
     lv_obj_set_style_bg_opa(s_fs_next_btn, LV_OPA_COVER, 0);
     lv_obj_set_style_shadow_width(s_fs_next_btn, 0, 0);
@@ -367,11 +382,10 @@ static void fs_browser_open(void)
     lv_obj_t *next_lbl = lv_label_create(s_fs_next_btn);
     lv_label_set_text(next_lbl, ">");
     lv_obj_set_style_text_font(next_lbl, &lv_font_global_16, 0);
-    /* 文字颜色也设为蓝色 */
     lv_obj_set_style_text_color(next_lbl, lv_color_hex(0x0000FF), 0);
     lv_obj_center(next_lbl);
 
-    s_fs_group = "sdcard";
+    s_fs_group = "sdcard";   /* 默认根目录 */
     fs_browser_show_page(0);
 
     /* 打开后自动定位到主界面当前播放的歌曲 */

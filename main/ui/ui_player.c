@@ -78,54 +78,55 @@ extern const lv_font_t lv_font_global_16;
 #define VBAT_PCT_MAX    4.2f
 
 static lv_obj_t *s_bri_draw    = NULL;  /* 抽屉容器 (常驻) */
-static lv_obj_t *s_bri_slider  = NULL;
-static lv_obj_t *s_bri_val     = NULL;
+static lv_obj_t *s_bri_slider  = NULL;  /* 亮度滑块 */
+static lv_obj_t *s_bri_val     = NULL;  /* 亮度数值标签 */
 static lv_obj_t *s_bri_overlay = NULL;  /* 全屏透明按钮 (展开时存在) */
-static bool      s_bri_expanded = false;
+static bool      s_bri_expanded = false; /* 抽屉是否已展开 */
 
 static void bri_open(void);
 static void bri_close(void);
 
-static lv_obj_t *s_status_label;
-static lv_obj_t *s_bat_fill;
-static lv_obj_t *s_title_label;
-static lv_obj_t *s_artist_label;
-static lv_obj_t *s_progress_slider;
-static lv_obj_t *s_time_current;
-static lv_obj_t *s_time_total;
-static lv_obj_t *s_fmt_val;
-static lv_obj_t *s_sr_val;
-static lv_obj_t *s_ch_val;
-static lv_obj_t *s_bit_val;
-static lv_obj_t *s_album_art;
-static lv_obj_t *s_album_img;
-static lv_obj_t *s_album_icon;
-static lv_img_dsc_t s_cover_dsc;
-static lv_obj_t *s_play_icon;
-static lv_obj_t *s_mode_icon;
+/* 播放器主界面控件句柄 */
+static lv_obj_t *s_status_label;    /* 顶部状态标签 (如 "3/20") */
+static lv_obj_t *s_bat_fill;        /* 电池图标填充条 */
+static lv_obj_t *s_title_label;     /* 歌名标签 */
+static lv_obj_t *s_artist_label;    /* 歌手标签 */
+static lv_obj_t *s_progress_slider; /* 进度滑块 */
+static lv_obj_t *s_time_current;    /* 当前时间标签 */
+static lv_obj_t *s_time_total;      /* 总时长标签 */
+static lv_obj_t *s_fmt_val;         /* 格式值 (MP3/FLAC/WAV) */
+static lv_obj_t *s_sr_val;          /* 采样率值 */
+static lv_obj_t *s_ch_val;          /* 声道数值 */
+static lv_obj_t *s_bit_val;         /* 位深值 */
+static lv_obj_t *s_album_art;       /* 封面容器 */
+static lv_obj_t *s_album_img;       /* 封面图片控件 */
+static lv_obj_t *s_album_icon;      /* 无封面时的默认图标 */
+static lv_img_dsc_t s_cover_dsc;    /* 封面图像描述符 */
+static lv_obj_t *s_play_icon;       /* 播放/暂停图标 */
+static lv_obj_t *s_mode_icon;       /* 播放模式图标 */
 
 /* 音量弹窗 */
-static lv_obj_t *s_vol_cont = NULL;
-static lv_obj_t *s_vol_bar  = NULL;
-static lv_obj_t *s_vol_val  = NULL;
-static int32_t   s_vol_last_ui = -1;
-static int       s_vol_idle = 0;
+static lv_obj_t *s_vol_cont = NULL;   /* 音量弹窗容器 */
+static lv_obj_t *s_vol_bar  = NULL;   /* 音量条 */
+static lv_obj_t *s_vol_val  = NULL;   /* 音量数值标签 */
+static int32_t   s_vol_last_ui = -1;  /* 上次显示的音量 */
+static int       s_vol_idle = 0;      /* 无变化计时 (ms) */
 typedef enum {
-    VOL_STATE_HIDDEN,
-    VOL_STATE_SHOWING,
-    VOL_STATE_HIDING,
+    VOL_STATE_HIDDEN,   /* 隐藏 */
+    VOL_STATE_SHOWING,  /* 滑入中 */
+    VOL_STATE_HIDING,   /* 滑出中 */
 } vol_state_t;
 static vol_state_t s_vol_state = VOL_STATE_HIDDEN;
 
 /* 播放列表: 当前文件夹联动 (仅读内存缓存 g_fs_cache, 不碰 SD) */
-static char s_pl_group[FS_GROUP_MAX];
-static int  s_pl_index = 0;
-static int  s_pl_count = 0;
+static char s_pl_group[FS_GROUP_MAX];   /* 当前播放列表所在分组 */
+static int  s_pl_index = 0;             /* 当前播放项索引 */
+static int  s_pl_count = 0;             /* 当前分组歌曲数 */
 
-static play_mode_t s_play_mode = PLAY_MODE_SEQUENTIAL;
-static bool        s_auto_advancing = false;
-static int64_t     s_last_user_cmd_us = 0;
-static bool        s_was_playing = false;
+static play_mode_t s_play_mode = PLAY_MODE_SEQUENTIAL;  /* 播放模式 */
+static bool        s_auto_advancing = false;   /* 是否自动切歌中 (决定文件缺失时行为) */
+static int64_t     s_last_user_cmd_us = 0;     /* 上次用户命令时刻 (节流) */
+static bool        s_was_playing = false;      /* 影子播放状态 (蓝牙重连续播用) */
 
 /* ── 文件不存在提示弹窗 ── */
 static lv_obj_t *s_dialog = NULL;
@@ -133,6 +134,7 @@ static void show_file_not_found(void);
 static void player_info_reset(void);
 
 /* ── 播放列表辅助 ── */
+/* 统计指定分组内的文件数 */
 static int player_count_files(const char *group)
 {
     if (!g_fs_cache || !group) return 0;
@@ -144,6 +146,7 @@ static int player_count_files(const char *group)
     return count;
 }
 
+/* 取分组内第 idx 个文件名 (按缓存顺序) */
 static const char *player_file_name_at(const char *group, int idx)
 {
     if (!g_fs_cache || !group) return NULL;
@@ -157,6 +160,7 @@ static const char *player_file_name_at(const char *group, int idx)
     return NULL;
 }
 
+/* 更新顶部状态标签: "当前/总数" */
 static void player_update_label(void)
 {
     char buf[32];
@@ -582,12 +586,13 @@ static void song_info_monitor_cb(lv_timer_t *timer)
     }
 }
 
+/* SD 卡状态监视 (轮询定时器): 插卡加载/拔卡清理 */
 static void fs_sd_monitor_cb(lv_timer_t *timer)
 {
     static bool last_ready = false;
     bool sd_ready = atomic_load_bool(&g_sd_ready);
 
-    if (!sd_ready && last_ready) {
+    if (!sd_ready && last_ready) {   /* 刚拔出 */
         /* 音频立即停止, 干净 close_decoder */
         audio_cmd_t cmd;
         memset(&cmd, 0, sizeof(cmd));
@@ -602,10 +607,10 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
 
         cover_clear();
 
-        fs_browser_on_sd_remove();
+        fs_browser_on_sd_remove();   /* 通知浏览器清空 */
     }
 
-    if (sd_ready && !last_ready) {
+    if (sd_ready && !last_ready) {   /* 刚插入 */
         fs_browser_on_sd_ready();
 
         /* 恢复上次歌曲: 读 flash 路径 → 在缓存中查找 → 找到则加载到解码器但不自动播放,
@@ -623,7 +628,7 @@ static void fs_sd_monitor_cb(lv_timer_t *timer)
                 cmd.type = AUDIO_CMD_PAUSE;
                 xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
 
-                fs_browser_jump();
+                fs_browser_jump();   /* 浏览器定位到该曲 */
             }
         }
     }
@@ -769,6 +774,7 @@ static void btn_key_poll_cb(lv_timer_t *timer)
     }
 }
 
+/* 初始化音量按键: 配输入引脚 + 创建 10ms 轮询定时器 */
 static void vol_key_init(void)
 {
     gpio_set_direction(PIN_VOL_UP, GPIO_MODE_INPUT);
@@ -778,21 +784,22 @@ static void vol_key_init(void)
 
 /* ── 亮度抽屉 ── */
 
-/* 滑块: 拖动实时改亮度, 松手存 NVS */
+/* 滑块事件: 拖动实时改亮度 (写 LEDC), 松手存 NVS */
 static void bri_slider_cb(lv_event_t *e)
 {
     lv_obj_t *sl = lv_event_get_target(e);
     if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
         uint8_t v = (uint8_t)lv_slider_get_value(sl);
-        lcd_set_brightness(v);
-        brightness_set(v);
-        power_mgr_set_cur_bri(v);
+        lcd_set_brightness(v);           /* 立即生效 */
+        brightness_set(v);               /* 更新内存值 */
+        power_mgr_set_cur_bri(v);        /* 同步电源管理的淡入/淡出起点 */
         lv_label_set_text_fmt(s_bri_val, "%d", (int)v);
     } else if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
-        brightness_save_to_nvs();
+        brightness_save_to_nvs();        /* 松手落盘 */
     }
 }
 
+/* 动画 exec 适配器: 把动画值设为抽屉容器 x 坐标 */
 static void bri_draw_set_x(void *obj, int32_t x)
 {
     lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)x);
