@@ -26,6 +26,7 @@
 #define APP_RC_CT_TL_RN_VOLUME_CHANGE  (1)
 
 #define CACHE_MAX 16
+#define VOL_STEP  8   /* 耳机音量±键一次步进 */
 
 /* 连接后音量设置时序: 等 AVRC 连上 → 再等 VOL_SET_DELAY_MS → 发音量 → 放行 A2DP 流启动.
  * 静音机制已删除: 窗口期流不启动, 到点先发音量再启流.
@@ -128,8 +129,9 @@ static bool cache_add(esp_bd_addr_t bda, const char *device_name)
         s_cache_count = 0;
     }
     memcpy(s_cache_bda[s_cache_count], bda, ESP_BD_ADDR_LEN);
-    strncpy(s_cache_name[s_cache_count], device_name, sizeof(s_cache_name[0]) - 1);
-    s_cache_name[s_cache_count][sizeof(s_cache_name[0]) - 1] = '\0';
+    size_t clen = strnlen(device_name, sizeof(s_cache_name[0]) - 1);
+    memcpy(s_cache_name[s_cache_count], device_name, clen);
+    s_cache_name[s_cache_count][clen] = '\0';
     s_cache_count++;
     return true;
 }
@@ -141,7 +143,9 @@ static void send_evt(bt_evt_type_t type, const char *name, int error)
     evt.type = type;
     evt.error = error;
     if (name) {
-        strncpy(evt.device_name, name, sizeof(evt.device_name) - 1);
+        size_t nlen = strnlen(name, sizeof(evt.device_name) - 1);
+        memcpy(evt.device_name, name, nlen);
+        evt.device_name[nlen] = '\0';
     }
     xQueueSend(s_iface.evt_queue, &evt, 0);
 }
@@ -154,10 +158,14 @@ static void send_state_rsp(void)
     evt.type = BT_EVT_STATE_RSP;
     if (s_connected) {
         evt.state = BT_STATE_CONNECTED;
-        strncpy(evt.device_name, s_connected_name, sizeof(evt.device_name) - 1);
+        size_t clen = strnlen(s_connected_name, sizeof(evt.device_name) - 1);
+        memcpy(evt.device_name, s_connected_name, clen);
+        evt.device_name[clen] = '\0';
     } else if (s_connecting) {
         evt.state = BT_STATE_CONNECTING;
-        strncpy(evt.device_name, s_connecting_name, sizeof(evt.device_name) - 1);
+        size_t clen = strnlen(s_connecting_name, sizeof(evt.device_name) - 1);
+        memcpy(evt.device_name, s_connecting_name, clen);
+        evt.device_name[clen] = '\0';
     } else {
         evt.state = BT_STATE_DISCONNECTED;
     }
@@ -294,9 +302,21 @@ static void bt_a2dp_hdl_avrc_tg_evt(uint16_t event, void *p_param)
             ESP_LOGI(RC_TAG, "耳机请求 上一曲");
             send_evt(BT_EVT_TRANSPORT_PREV, NULL, 0);
             break;
+        case ESP_AVRC_PT_CMD_VOL_UP:
+            ESP_LOGI(RC_TAG, "耳机 音量+");
+            volume_inc(VOL_STEP);
+            break;
+        case ESP_AVRC_PT_CMD_VOL_DOWN:
+            ESP_LOGI(RC_TAG, "耳机 音量-");
+            volume_inc(-VOL_STEP);
+            break;
         default:
             break;
         }
+        break;
+    case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
+        ESP_LOGI(RC_TAG, "耳机绝对音量: %d", rc->set_abs_vol.volume);
+        volume_set(rc->set_abs_vol.volume);
         break;
     default:
         break;
@@ -585,6 +605,8 @@ static void bt_a2dp_hdl_stack_up(void)
     esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_STOP);
     esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_FORWARD);
     esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_BACKWARD);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_VOL_UP);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_VOL_DOWN);
     esp_avrc_tg_set_psth_cmd_filter(ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD, &psth);
 
     esp_avrc_rn_evt_cap_mask_t evt_set = {0};

@@ -67,8 +67,9 @@ void ui_loop_task(void *arg)
                     } else {
                         memset(&bt_cmd, 0, sizeof(bt_cmd));
                         bt_cmd.type = BT_CMD_CONNECT;
-                        strncpy(bt_cmd.device_name, app_cmd.param,
-                                sizeof(bt_cmd.device_name) - 1);
+                        size_t plen = strnlen(app_cmd.param, sizeof(bt_cmd.device_name) - 1);
+                        memcpy(bt_cmd.device_name, app_cmd.param, plen);
+                        bt_cmd.device_name[plen] = '\0';
                         xQueueSend(g_ui_bt_iface->cmd_queue, &bt_cmd, 0);
                         printf("[LVGL] connecting: %s\n", app_cmd.param);
                     }

@@ -316,8 +316,9 @@ void bt_list_on_scan_done(void)
 
     s_bt_display_count = s_bt_pending_count;
     for (int i = 0; i < s_bt_pending_count; i++) {
-        strncpy(s_bt_display[i], s_bt_pending[i], sizeof(s_bt_display[0]) - 1);
-        s_bt_display[i][sizeof(s_bt_display[0]) - 1] = '\0';
+        size_t plen = strnlen(s_bt_pending[i], sizeof(s_bt_display[0]) - 1);
+        memcpy(s_bt_display[i], s_bt_pending[i], plen);
+        s_bt_display[i][plen] = '\0';
     }
     s_bt_pending_count = 0;
 

@@ -10,6 +10,16 @@
 #include "esp_vfs_fat.h"
 #include "ff.h"
 
+static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
+{
+    if (dst_sz == 0) {
+        return;
+    }
+    size_t n = strnlen(src, dst_sz - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 #define TAG_MUSIC_SCAN   "MUSIC_SCAN"
 
 #define MOUNT_POINT       "/sdcard"
@@ -58,8 +68,7 @@ static bool path_list_add(path_list_t *list, const char *path)
         list->capacity = new_cap;
     }
     char *dst = list->buf + (size_t)list->count * PATH_BUF_SIZE;
-    strncpy(dst, path, PATH_BUF_SIZE - 1);
-    dst[PATH_BUF_SIZE - 1] = '\0';
+    buf_copy(dst, PATH_BUF_SIZE, path);
     list->count++;
     return true;
 }

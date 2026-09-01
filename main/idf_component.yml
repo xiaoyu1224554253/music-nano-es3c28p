@@ -2,7 +2,13 @@
 dependencies:
   ## Required IDF version
   idf:
-    version: '>=4.1.0'
+    version: '>=5.5.5'
+  # #必须使用 idf 版本>=5.5.5
+  # #在 ESP-IDF v5.5.2 ~ v5.5.4 上存在 SPI 总线锁"丢失唤醒"死锁 bug
+  # #（esp-idf Issue #17860 / IDFGH-16778，修复 commit 26263a36）
+  # #https://github.com/espressif/esp-idf/commit/26263a36a2b3fe0649ccb20a02517c6c4b18e01b
+
+
   # # Put list of dependencies here
   # # For components maintained by Espressif:
   # component: "~1.0.0"

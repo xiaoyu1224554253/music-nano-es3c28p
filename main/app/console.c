@@ -1,14 +1,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/timers.h"
+#include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
+#include "esp_debug_helpers.h"
+#include "esp_private/freertos_debug.h"
+#include "xtensa_context.h"
 #include "app.h"
 #include "sys_monitor.h"
 
@@ -118,12 +123,57 @@ static void cmd_psram(void)
            total / 1024, largest / 1024);
 }
 
+/* 打印指定 RTOS 任务的 backtrace (带任务名).
+ * 阻塞/挂起任务: 用 TCB 保存的栈顶 pxTopOfStack (pc/a1/a0) 回溯其自身栈, 精确.
+ * 正在运行的任务: 快照为最近一次被切出时的上下文 (略旧, 但栈内容仍在).
+ * 本任务(自身): 用实时上下文. */
+static void cmd_backtrace(const char *name)
+{
+    TaskHandle_t h = xTaskGetHandle(name);
+    if (!h) {
+        printf("[bt] 未找到任务: %s\n", name);
+        return;
+    }
+
+    esp_backtrace_frame_t fr = {0};
+
+    if (h == xTaskGetCurrentTaskHandle()) {
+        esp_backtrace_get_start(&fr.pc, &fr.sp, &fr.next_pc);
+        printf("[bt] %s (current task)\n", name);
+        esp_backtrace_print_from_frame(50, &fr, false);
+        return;
+    }
+
+    TaskSnapshot_t snap;
+    vTaskSuspendAll();                       /* 冻结调度, 与 esp_backtrace_print_all_tasks 一致 */
+    BaseType_t ok = vTaskGetSnapshot(h, &snap);
+    xTaskResumeAll();
+
+    if (ok != pdTRUE) {
+        printf("[bt] 任务快照失败: %s\n", name);
+        return;
+    }
+
+    XtExcFrame *f = (XtExcFrame *)snap.pxTopOfStack;
+    fr.pc = f->pc;
+    fr.sp = f->a1;
+    fr.next_pc = f->a0;
+    printf("[bt] %s (saved stack)\n", name);
+    esp_backtrace_print_from_frame(50, &fr, false);
+}
+
+static void cmd_backtrace_all(void)
+{
+    printf("[bt] 所有任务 backtrace:\n");
+    esp_backtrace_print_all_tasks(50);
+}
+
 static void console_task(void *arg)
 {
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 
     printf("\n=== 音乐播放器 ===\n");
-    printf("系统命令: stats | ram | psram | vbat | temp\n");
+    printf("系统命令: stats | ram | psram | vbat | temp | bt [任务名]\n");
     printf("应用命令: scan | conn <名称> | disconn | play | stop | pause | info\n");
     printf("命令> ");
 
@@ -149,6 +199,10 @@ static void console_task(void *arg)
                         printf("[CPU温度] %.1f C\n", t);
                     } else if (strcmp(line, "psram") == 0) {
                         cmd_psram();
+                    } else if (strcmp(line, "bt") == 0) {
+                        cmd_backtrace_all();
+                    } else if (strncmp(line, "bt ", 3) == 0) {
+                        cmd_backtrace(line + 3);
                     } else {
                         app_cmd_t cmd;
                         memset(&cmd, 0, sizeof(cmd));
@@ -157,7 +211,9 @@ static void console_task(void *arg)
                             cmd.type = APP_CMD_BT_SCAN;
                         } else if (strncmp(line, "conn ", 5) == 0) {
                             cmd.type = APP_CMD_BT_CONNECT;
-                            strncpy(cmd.param, line + 5, sizeof(cmd.param) - 1);
+                            size_t plen = strnlen(line + 5, sizeof(cmd.param) - 1);
+                            memcpy(cmd.param, line + 5, plen);
+                            cmd.param[plen] = '\0';
                         } else if (strcmp(line, "disconn") == 0) {
                             cmd.type = APP_CMD_BT_DISCONNECT;
                         } else if (strcmp(line, "play") == 0) {

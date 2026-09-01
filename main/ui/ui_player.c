@@ -65,6 +65,18 @@ extern const lv_font_t lv_font_global_16;
 #define BRI_ANIM_IN_MS  150             /* 弹出: overshoot 过冲 */
 #define BRI_ANIM_OUT_MS 300             /* 收回: 线性 */
 
+/* ── 电池图标: 顶部居中, 位于 n/n 标签上方 ── */
+#define BAT_BODY_W      18
+#define BAT_BODY_H      9
+#define BAT_BODY_X      77
+#define BAT_BODY_Y      7
+#define BAT_NUB_W       2
+#define BAT_NUB_H       4
+#define BAT_PAD         2               /* 填充条距壳内边距 */
+#define BAT_FILL_MAX_W  (BAT_BODY_W - 2 * BAT_PAD)
+#define VBAT_PCT_MIN    3.3f
+#define VBAT_PCT_MAX    4.2f
+
 static lv_obj_t *s_bri_draw    = NULL;  /* 抽屉容器 (常驻) */
 static lv_obj_t *s_bri_slider  = NULL;
 static lv_obj_t *s_bri_val     = NULL;
@@ -75,6 +87,7 @@ static void bri_open(void);
 static void bri_close(void);
 
 static lv_obj_t *s_status_label;
+static lv_obj_t *s_bat_fill;
 static lv_obj_t *s_title_label;
 static lv_obj_t *s_artist_label;
 static lv_obj_t *s_progress_slider;
@@ -225,7 +238,9 @@ static void player_play_index(int idx)
     audio_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = AUDIO_CMD_PLAY;
-    strncpy(cmd.path, path, sizeof(cmd.path) - 1);
+    size_t plen = strnlen(path, sizeof(cmd.path) - 1);
+    memcpy(cmd.path, path, plen);
+    cmd.path[plen] = '\0';
 
     if (!audio_user_send(&cmd)) return;
 
@@ -275,7 +290,9 @@ void player_advance(void)
     audio_cmd_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = AUDIO_CMD_PLAY;
-    strncpy(cmd.path, path, sizeof(cmd.path) - 1);
+    size_t plen = strnlen(path, sizeof(cmd.path) - 1);
+    memcpy(cmd.path, path, plen);
+    cmd.path[plen] = '\0';
     xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
 
     s_pl_index = next;
@@ -393,7 +410,9 @@ void player_toggle_play(void)
             audio_cmd_t cmd;
             memset(&cmd, 0, sizeof(cmd));
             cmd.type = AUDIO_CMD_PLAY;
-            strncpy(cmd.path, path, sizeof(cmd.path) - 1);
+            size_t plen = strnlen(path, sizeof(cmd.path) - 1);
+            memcpy(cmd.path, path, plen);
+            cmd.path[plen] = '\0';
             xQueueSend(g_ui_audio_cmd_queue, &cmd, 0);
             s_was_playing = true;
             printf("[LVGL] RESUME: %s\n", path);
@@ -492,6 +511,25 @@ static void player_info_reset(void)
 /* ── 歌曲信息轮询: 读 g_song_info 更新标签/进度 ── */
 static void song_info_monitor_cb(lv_timer_t *timer)
 {
+    /* 电池图标: 读 g_vbat 换算百分比, 变化才更新填充条 */
+    {
+        static int s_last_pct = -1;
+        float v = atomic_load_float(&g_vbat);
+        int pct = (int)((v - VBAT_PCT_MIN) / (VBAT_PCT_MAX - VBAT_PCT_MIN) * 100.0f);
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+
+        if (pct != s_last_pct) {
+            s_last_pct = pct;
+            int w = BAT_FILL_MAX_W * pct / 100;
+            if (pct > 0 && w < 1) w = 1;
+            lv_obj_set_width(s_bat_fill, w);
+            lv_obj_set_style_bg_color(s_bat_fill,
+                pct > 30 ? lv_color_hex(0x2E7D32) :
+                pct >= 20 ? lv_color_hex(0xFFA000) : lv_color_hex(0xE53935), 0);
+        }
+    }
+
     /* 播放/暂停图标跟随实际播放状态 */
     if (s_play_icon) {
         lv_label_set_text(s_play_icon,
@@ -950,12 +988,47 @@ void ui_player_init(void)
 
     /* 文字 */
     s_status_label = lv_label_create(scr);
-    lv_obj_set_pos(s_status_label, 54, 15);
+    lv_obj_set_pos(s_status_label, 54, 20);
     lv_obj_set_size(s_status_label, 65, 16);
     lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_status_label, COLOR_MUTED, 0);
     lv_label_set_text(s_status_label, "PLAYER");
+
+    /* 电池图标 (n/n 上方) */
+    lv_obj_t *bat_body = lv_obj_create(scr);
+    lv_obj_set_pos(bat_body, BAT_BODY_X, BAT_BODY_Y);
+    lv_obj_set_size(bat_body, BAT_BODY_W, BAT_BODY_H);
+    lv_obj_set_style_bg_opa(bat_body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(bat_body, 2, 0);
+    lv_obj_set_style_border_color(bat_body, COLOR_MUTED, 0);
+    lv_obj_set_style_border_width(bat_body, 1, 0);
+    lv_obj_set_style_pad_all(bat_body, 0, 0);
+    lv_obj_set_style_shadow_width(bat_body, 0, 0);
+    lv_obj_clear_flag(bat_body, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(bat_body, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *bat_nub = lv_obj_create(scr);
+    lv_obj_set_pos(bat_nub, BAT_BODY_X + BAT_BODY_W, BAT_BODY_Y + (BAT_BODY_H - BAT_NUB_H) / 2);
+    lv_obj_set_size(bat_nub, BAT_NUB_W, BAT_NUB_H);
+    lv_obj_set_style_bg_color(bat_nub, COLOR_MUTED, 0);
+    lv_obj_set_style_bg_opa(bat_nub, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(bat_nub, 1, 0);
+    lv_obj_set_style_border_width(bat_nub, 0, 0);
+    lv_obj_set_style_shadow_width(bat_nub, 0, 0);
+    lv_obj_clear_flag(bat_nub, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(bat_nub, LV_SCROLLBAR_MODE_OFF);
+
+    s_bat_fill = lv_obj_create(scr);
+    lv_obj_set_pos(s_bat_fill, BAT_BODY_X + BAT_PAD, BAT_BODY_Y + BAT_PAD);
+    lv_obj_set_size(s_bat_fill, BAT_FILL_MAX_W, BAT_BODY_H - 2 * BAT_PAD);
+    lv_obj_set_style_bg_color(s_bat_fill, lv_color_hex(0x2E7D32), 0);
+    lv_obj_set_style_bg_opa(s_bat_fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_bat_fill, 1, 0);
+    lv_obj_set_style_border_width(s_bat_fill, 0, 0);
+    lv_obj_set_style_shadow_width(s_bat_fill, 0, 0);
+    lv_obj_clear_flag(s_bat_fill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(s_bat_fill, LV_SCROLLBAR_MODE_OFF);
 
     /* 专辑封面区域 */
     s_album_art = lv_obj_create(scr);

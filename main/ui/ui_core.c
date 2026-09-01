@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "drv_display.h"
+#include "touch_task.h"
 #include "ui_core.h"
 #include "settings.h"
 
@@ -47,23 +48,44 @@ void ui_touch_set_enabled(bool enable)
     s_touch_enabled = enable;
 }
 
+/* 触摸任务心跳监视: 停摆超时只打日志告警 (不碰 I2C, 不重装驱动) */
+static void touch_heartbeat_watch(void)
+{
+    static uint32_t s_last_hb = 0;
+    static int64_t  s_last_hb_us = 0;
+    static bool     s_warned = false;
+
+    uint32_t hb = touch_get_heartbeat();
+    if (hb != s_last_hb) {
+        s_last_hb = hb;
+        s_last_hb_us = esp_timer_get_time();
+        s_warned = false;
+    } else if (!s_warned && esp_timer_get_time() - s_last_hb_us > 2000000LL) {
+        s_warned = true;
+        printf("[ui] 触摸任务心跳停止, 触摸失效\n");
+    }
+}
+
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
+    touch_heartbeat_watch();
+
     if (!s_touch_enabled) {
         data->state = LV_INDEV_STATE_REL;
         return;
     }
 
-    uint16_t tx, ty;
-    if (touch_read(&tx, &ty)) {
-        ty = (uint16_t)(((int)ty - TOUCH_Y_MIN) * (TFT_VER_RES - 1)
-                        / (TOUCH_Y_MAX - TOUCH_Y_MIN));
+    if (touch_is_present()) {
+        int32_t tx, ty;
+        touch_get_point(&tx, &ty);
+        ty = (int32_t)(((int)ty - TOUCH_Y_MIN) * (TFT_VER_RES - 1)
+                       / (TOUCH_Y_MAX - TOUCH_Y_MIN));
         tx = TFT_HOR_RES - 1 - tx;
         ty = TFT_VER_RES - 1 - ty;
         if (tx >= TFT_HOR_RES) tx = TFT_HOR_RES - 1;
         if (ty >= TFT_VER_RES) ty = TFT_VER_RES - 1;
-        data->point.x = tx;
-        data->point.y = ty;
+        data->point.x = (lv_coord_t)tx;
+        data->point.y = (lv_coord_t)ty;
         data->state = LV_INDEV_STATE_PR;
     } else {
         data->state = LV_INDEV_STATE_REL;
@@ -96,7 +118,7 @@ void ui_core_display_init(void)
     lv_init();
 
     s_panel = lcd_get_panel();
-    touch_init();
+    touch_task_start();
 
     lv_disp_draw_buf_init(&s_draw_buf_dsc, s_draw_buf1, s_draw_buf2, LVGL_BUF_SIZE);
     lv_disp_drv_init(&s_disp_drv);

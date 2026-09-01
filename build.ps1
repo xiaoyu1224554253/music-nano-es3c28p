@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$env:IDF_PATH           = "C:\Users\123\esp\v5.5.2\esp-idf"
+$env:IDF_PATH           = "C:\Users\123\esp\v5.5.5\esp-idf"
 $env:IDF_PYTHON_ENV_PATH = "d:\espressif\python_env\idf5.5_py3.11_env"
 $env:IDF_TOOLS_PATH     = "d:\espressif"
 $env:ESP_ROM_ELF_DIR    = "d:\espressif\tools\esp-rom-elfs\20241011"

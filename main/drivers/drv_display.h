@@ -22,10 +22,6 @@ esp_lcd_panel_handle_t lcd_get_panel(void);
 /* 背光亮度 (LEDC PWM, 0~255) */
 void lcd_set_brightness(uint8_t level);
 
-/* 触摸屏 (CST816, I2C) */
-void touch_init(void);
-bool touch_read(uint16_t *x, uint16_t *y);
-
 #ifdef __cplusplus
 }
 #endif

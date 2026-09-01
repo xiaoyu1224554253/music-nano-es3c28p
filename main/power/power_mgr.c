@@ -6,6 +6,7 @@
 #include "esp_sleep.h"
 #include "lvgl.h"
 #include "drv_display.h"
+#include "touch_task.h"
 #include "settings.h"
 #include "bt_a2dp.h"
 #include "ui_core.h"
@@ -118,6 +119,7 @@ static void screen_off(void)
     screen_fade(0, NULL);
     set_lvgl_slow_refresh(true);
     ui_touch_set_enabled(false);
+    touch_task_set_enabled(false);
     ESP_LOGI(TAG, "息屏 (BT 保持连接)");
 }
 
@@ -127,6 +129,7 @@ static void screen_on(void)
     s_state = PWR_ACTIVE;
     set_lvgl_slow_refresh(false);
     ui_touch_set_enabled(true);
+    touch_task_set_enabled(true);
     screen_fade(brightness_get(), NULL);
     ESP_LOGI(TAG, "亮屏");
 }

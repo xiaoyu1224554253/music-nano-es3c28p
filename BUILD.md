@@ -5,7 +5,7 @@
 打开 PowerShell 后先导出 ESP-IDF 工具链：
 
 ```powershell
-. C:\Users\123\esp\v5.5.2\esp-idf\export.ps1
+. C:\Users\123\esp\v5.5.5\esp-idf\export.ps1
 ```
 
 确认 `idf.py` 可用：

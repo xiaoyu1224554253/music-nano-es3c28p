@@ -305,7 +305,7 @@ void cover_init(QueueHandle_t app_cmd_queue)
     }
 
     s_task = xTaskCreateStaticPinnedToCore(cover_task, "cover", COVER_STACK_WORDS,
-                                           NULL, 2, s_stack, s_tcb, 1);
+                                           NULL, 1, s_stack, s_tcb, 1);
     ESP_LOGI(COVER_TAG, "封面解码任务已创建 (PSRAM 栈)");
 }
 

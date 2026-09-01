@@ -6,6 +6,8 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
@@ -17,6 +19,16 @@
 #include "esp_heap_caps.h"
 #include "atomic_utils.h"
 #include "sys_monitor.h"
+
+static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
+{
+    if (dst_sz == 0) {
+        return;
+    }
+    size_t n = strnlen(src, dst_sz - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 
 #define TAG_SDMMC   "SDMMC"
 #define TAG_DETECT  "SD_DETECT"
@@ -32,9 +44,11 @@
 #define VBAT_ADC_UNIT   ADC_UNIT_1
 #define VBAT_ADC_CHAN   ADC_CHANNEL_7
 
+#define VBAT_DIVIDER_RATIO 2.0f
+
 #define SAMPLE_COUNT  10
 #define SAMPLE_DELAY_MS 10
-#define SENSOR_INTERVAL_TICKS 25
+#define SENSOR_INTERVAL_TICKS 10
 
 #define CPU_TEMP_OFFSET_C  20.0f
 #define MUSIC_CACHE        "/sdcard/.music_cache"
@@ -47,6 +61,7 @@ volatile bool  g_sd_manual_rescan = false;
 fs_cache_t     *g_fs_cache     = NULL;
 
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+static adc_cali_handle_t         s_cali_handle = NULL;
 
 static sdmmc_card_t *s_card    = NULL;
 static bool          s_mounted = false;
@@ -157,14 +172,12 @@ static fs_cache_t *sd_load_cache_to_psram(void)
 
         if (strncmp(name, "sdcard_", 7) == 0) {
             char group[FS_GROUP_MAX];
-            strncpy(group, name, FS_GROUP_MAX - 1);
-            group[FS_GROUP_MAX - 1] = '\0';
+            buf_copy(group, FS_GROUP_MAX, name);
             char *dot = strrchr(group, '.');
             if (dot) *dot = '\0';
 
-            strncpy(cache->entries[cache->count].name, group + 7, FS_NAME_MAX - 1);
-            cache->entries[cache->count].name[FS_NAME_MAX - 1] = '\0';
-            strncpy(cache->entries[cache->count].group, "sdcard", FS_GROUP_MAX - 1);
+            buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, group + 7);
+            buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, "sdcard");
             cache->entries[cache->count].is_dir = true;
             cache->count++;
         }
@@ -195,9 +208,8 @@ static fs_cache_t *sd_load_cache_to_psram(void)
                     while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
                         line[--len] = '\0';
                     if (len > 0) {
-                        strncpy(cache->entries[cache->count].name, line, FS_NAME_MAX - 1);
-                        cache->entries[cache->count].name[FS_NAME_MAX - 1] = '\0';
-                        strncpy(cache->entries[cache->count].group, "sdcard", FS_GROUP_MAX - 1);
+                        buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, line);
+                        buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, "sdcard");
                         cache->entries[cache->count].is_dir = false;
                         cache->count++;
                     }
@@ -208,8 +220,7 @@ static fs_cache_t *sd_load_cache_to_psram(void)
 
         if (strncmp(name, "sdcard_", 7) == 0) {
             char group[FS_GROUP_MAX];
-            strncpy(group, name, FS_GROUP_MAX - 1);
-            group[FS_GROUP_MAX - 1] = '\0';
+            buf_copy(group, FS_GROUP_MAX, name);
             char *dot = strrchr(group, '.');
             if (dot) *dot = '\0';
 
@@ -223,9 +234,8 @@ static fs_cache_t *sd_load_cache_to_psram(void)
                     while (len > 0 && (line[len-1]=='\n' || line[len-1]=='\r'))
                         line[--len] = '\0';
                     if (len > 0) {
-                        strncpy(cache->entries[cache->count].name, line, FS_NAME_MAX - 1);
-                        cache->entries[cache->count].name[FS_NAME_MAX - 1] = '\0';
-                        strncpy(cache->entries[cache->count].group, group, FS_GROUP_MAX - 1);
+                        buf_copy(cache->entries[cache->count].name, FS_NAME_MAX, line);
+                        buf_copy(cache->entries[cache->count].group, FS_GROUP_MAX, group);
                         cache->entries[cache->count].is_dir = false;
                         cache->count++;
                     }
@@ -284,12 +294,10 @@ bool fs_cache_find_by_path(const char *path,
         fs_build_real_path(e->group, e->name, real, sizeof(real));
         if (strcmp(real, path) == 0) {
             if (group_out && group_size > 0) {
-                strncpy(group_out, e->group, group_size - 1);
-                group_out[group_size - 1] = '\0';
+                buf_copy(group_out, group_size, e->group);
             }
             if (name_out && name_size > 0) {
-                strncpy(name_out, e->name, name_size - 1);
-                name_out[name_size - 1] = '\0';
+                buf_copy(name_out, name_size, e->name);
             }
             return true;
         }
@@ -387,7 +395,15 @@ static float read_vbat(void)
 {
     int raw;
     adc_oneshot_read(s_adc_handle, VBAT_ADC_CHAN, &raw);
-    return (float)raw / 4095.0f * 3.3f * 2.0f;
+
+    int mv = 0;
+    if (s_cali_handle != NULL) {
+        adc_cali_raw_to_voltage(s_cali_handle, raw, &mv);
+    } else {
+        mv = raw * 3300 / 4095;
+    }
+
+    return (float)mv / 1000.0f * VBAT_DIVIDER_RATIO;
 }
 
 static void sample_sensors(void)
@@ -424,6 +440,15 @@ static void sys_monitor_task(void *arg)
         .bitwidth = ADC_BITWIDTH_12,
     };
     adc_oneshot_config_channel(s_adc_handle, VBAT_ADC_CHAN, &chan_cfg);
+
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id  = VBAT_ADC_UNIT,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    if (adc_cali_create_scheme_line_fitting(&cali_cfg, &s_cali_handle) != ESP_OK) {
+        ESP_LOGW(TAG_ADC, "eFuse 两点校准不可用, 退回线性估算");
+    }
 
     bool last = (gpio_get_level(PIN_SD_DETECT) == 1);
     int  tick = SENSOR_INTERVAL_TICKS;

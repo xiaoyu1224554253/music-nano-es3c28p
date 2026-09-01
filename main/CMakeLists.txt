@@ -20,6 +20,7 @@ idf_component_register(SRCS "main.c"
                             "ui/menu/menu_browser.c"
                             "ui/menu/menu_bt.c"
                             "drivers/drv_display.c"
+                            "drivers/touch_task.c"
                             "resources/icon_file.c"
                             "resources/lv_font_global_16.c"
                     PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec
