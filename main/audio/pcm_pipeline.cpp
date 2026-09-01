@@ -1,23 +1,23 @@
 #include "pcm_pipeline.h"
-#include "resampler.h"
-#include "pcm_convert.h"
+#include "impl/pcm_convert.h"
+#include "resampler_fxp.h"
 
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include "esp_timer.h"
 
 using namespace esp_audio_libs;
 
-#define TARGET_RATE   44100.0f
+#define TARGET_RATE   44100
 #define TARGET_BITS   16
 #define TARGET_CH     2
 
 /* 最坏输入: MPEG1 stereo 1152 帧/块 */
 #define MAX_IN_FRAMES  1152
-/* 最坏输出: 8kHz MPEG2.5 mono (576 帧) -> 44100/8000≈5.5x ≈ 3175 帧, 取 4096 */
-#define MAX_OUT_FRAMES 4096
 
 struct pcm_pipeline_s {
-    resampler::Resampler *resampler;
+    resampler_fxp_t *res_fxp;
 
     bool     active;
     bool     need_resample;
@@ -29,6 +29,10 @@ struct pcm_pipeline_s {
     uint8_t  src_ch;
 
     uint8_t *stereo_in;   /* mono -> stereo 上混临时缓冲 */
+
+    int64_t  res_us;          /* 重采样累计耗时 (诊断) */
+    int64_t  res_window_t0;   /* 统计窗口起点 */
+    uint64_t res_frames;      /* 重采样累计输出帧数 (诊断) */
 };
 
 pcm_pipeline_t *pcm_pipeline_create(void)
@@ -47,9 +51,9 @@ pcm_pipeline_t *pcm_pipeline_create(void)
 void pcm_pipeline_close(pcm_pipeline_t *p)
 {
     if (!p) return;
-    if (p->resampler) {
-        delete p->resampler;
-        p->resampler = NULL;
+    if (p->res_fxp) {
+        resampler_fxp_free(p->res_fxp);
+        p->res_fxp = NULL;
     }
     p->active = false;
     p->need_resample = false;
@@ -81,30 +85,20 @@ bool pcm_pipeline_open(pcm_pipeline_t *p, uint32_t src_rate, uint8_t src_bits, u
     p->src_ch   = src_ch;
 
     p->need_upmix    = (src_ch == 1);
-    p->need_resample = (src_rate != (uint32_t)TARGET_RATE);
+    p->need_resample = (src_rate != TARGET_RATE);
 
     if (p->need_resample) {
-        resampler::ResamplerConfiguration cfg;
-        cfg.source_sample_rate      = (float)src_rate;
-        cfg.target_sample_rate      = TARGET_RATE;
-        cfg.source_bits_per_sample  = src_bits;
-        cfg.target_bits_per_sample  = TARGET_BITS;
-        cfg.channels                = TARGET_CH;   /* 上混后恒为 stereo */
-        cfg.use_pre_or_post_filter  = true;        /* 降采样抗混叠 */
-        cfg.subsample_interpolate   = false;
-        cfg.number_of_taps          = 32;
-        cfg.number_of_filters       = 8;
-
-        p->resampler = new resampler::Resampler(MAX_IN_FRAMES * TARGET_CH,
-                                                MAX_OUT_FRAMES * TARGET_CH);
-        if (!p->resampler || !p->resampler->initialize(cfg)) {
-            delete p->resampler;
-            p->resampler = NULL;
+        p->res_fxp = resampler_fxp_create();
+        if (!p->res_fxp || !resampler_fxp_open(p->res_fxp, src_rate, TARGET_CH)) {
+            resampler_fxp_free(p->res_fxp);
+            p->res_fxp = NULL;
             return false;
         }
     }
 
     p->active = true;
+    p->res_us = 0;
+    p->res_window_t0 = esp_timer_get_time();
     return true;
 }
 
@@ -124,25 +118,36 @@ size_t pcm_pipeline_process(pcm_pipeline_t *p, const void *src, size_t src_frame
         in = p->stereo_in;
     }
 
-    /* 2) 源速率 == 44100: 直接 (必要时做位深转换) */
+    /* 2) 源速率 == 44100: 直接拷贝 */
     if (!p->need_resample) {
-        if (p->src_bits == TARGET_BITS) {
-            size_t bytes = src_frames * TARGET_CH * (TARGET_BITS / 8);
-            if (bytes > dst_cap_bytes) bytes = dst_cap_bytes;
-            memcpy(dst, in, bytes);
-            return bytes;
-        }
-        pcm_convert::copy_frames(in, dst,
-                                 p->src_bps, TARGET_CH,
-                                 TARGET_BITS / 8, TARGET_CH,
-                                 (uint32_t)src_frames);
-        return src_frames * TARGET_CH * (TARGET_BITS / 8);
+        size_t bytes = src_frames * TARGET_CH * (TARGET_BITS / 8);
+        if (bytes > dst_cap_bytes) bytes = dst_cap_bytes;
+        memcpy(dst, in, bytes);
+        return bytes;
     }
 
-    /* 3) 重采样到 44.1kHz */
+    /* 3) 纯整数重采样到 44.1kHz */
     size_t out_frames_cap = dst_cap_bytes / (TARGET_CH * (TARGET_BITS / 8));
-    resampler::ResamplerResults res =
-        p->resampler->resample(in, dst, src_frames, out_frames_cap, 0.0f);
+    int64_t t0 = esp_timer_get_time();
+    size_t out_frames = resampler_fxp_process(p->res_fxp,
+                                              (const int16_t *)in, src_frames,
+                                              (int16_t *)dst, out_frames_cap);
+    p->res_us += esp_timer_get_time() - t0;
+    p->res_frames += out_frames;
 
-    return res.frames_generated * TARGET_CH * (TARGET_BITS / 8);
+    /* 每 10s 汇报重采样 CPU 占比 (诊断) */
+    int64_t now = esp_timer_get_time();
+    if (now - p->res_window_t0 > 10 * 1000000) {
+        int64_t win = now - p->res_window_t0;
+        printf("[PIPE] 重采样 %d ms / %u 帧 / %.1f s (%.1f%% core, %.0f ns/帧, 入%u帧/次)\n",
+               (int)(p->res_us / 1000), (unsigned)p->res_frames, win / 1000000.0,
+               (double)p->res_us * 100.0 / win,
+               (double)p->res_us * 1000.0 / (p->res_frames ? p->res_frames : 1),
+               (unsigned)src_frames);
+        p->res_us = 0;
+        p->res_frames = 0;
+        p->res_window_t0 = now;
+    }
+
+    return out_frames * TARGET_CH * (TARGET_BITS / 8);
 }

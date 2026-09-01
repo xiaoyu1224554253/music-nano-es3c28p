@@ -74,6 +74,60 @@ void volume_save_to_nvs(void)
     }
 }
 
+/* ──────────────────────────── 亮度 ──────────────────────────── */
+#define BRIGHT_KEY   "brightness"
+
+static uint8_t s_brightness = 128;
+
+uint8_t brightness_get(void)
+{
+    return s_brightness;
+}
+
+void brightness_set(uint8_t v)
+{
+    s_brightness = v;
+}
+
+void brightness_load_from_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &handle) != ESP_OK) {
+        return;
+    }
+
+    uint8_t v = BRIGHTNESS_DEFAULT;
+    esp_err_t ret = nvs_get_u8(handle, BRIGHT_KEY, &v);
+    nvs_close(handle);
+
+    /* uint8_t 天然 ≤ 255, 只检查下限即可 */
+    if (ret == ESP_OK && (int)v >= BRIGHTNESS_MIN) {
+        s_brightness = v;
+        ESP_LOGI(TAG, "已从 NVS 恢复亮度: %u", v);
+    }
+}
+
+void brightness_save_to_nvs(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(SETTINGS_NS, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open 失败");
+        return;
+    }
+
+    esp_err_t ret = nvs_set_u8(handle, BRIGHT_KEY, s_brightness);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "已保存亮度: %u", s_brightness);
+    } else {
+        ESP_LOGW(TAG, "保存失败 (%s)", esp_err_to_name(ret));
+    }
+}
+
 /* ──────────────────────── 上次播放歌曲 ──────────────────────── */
 #define LAST_KEY   "song"
 #define LAST_MAX   512

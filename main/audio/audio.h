@@ -24,6 +24,7 @@ typedef struct {
     char     format[SONG_FORMAT_MAX];
     uint32_t sample_rate;
     uint8_t  channels;
+    uint8_t  bits_per_sample;
     uint32_t bitrate_kbps;
     uint32_t duration_sec;
     uint32_t elapsed_sec;
@@ -40,6 +41,7 @@ typedef struct audio_decoder_s {
     void      (*close)(struct audio_decoder_s *self);
     uint32_t  (*get_sample_rate)(struct audio_decoder_s *self);
     uint8_t   (*get_channels)(struct audio_decoder_s *self);
+    uint8_t   (*get_bits)(struct audio_decoder_s *self);
     uint32_t  (*get_bitrate)(struct audio_decoder_s *self);
     uint32_t  (*get_file_size)(struct audio_decoder_s *self);
     uint32_t  (*get_position)(struct audio_decoder_s *self);
@@ -53,6 +55,7 @@ typedef struct audio_decoder_s {
 
 audio_decoder_t *decoder_mp3_create(void);
 audio_decoder_t *decoder_flac_create(void);
+audio_decoder_t *decoder_wav_create(void);
 
 #ifdef __cplusplus
 }

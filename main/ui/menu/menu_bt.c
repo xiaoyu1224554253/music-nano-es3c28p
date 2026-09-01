@@ -129,6 +129,7 @@ static void bt_refresh_list(void)
         lv_obj_t *btn = lv_list_add_btn(s_bt_list, NULL, "No devices");
         lv_obj_set_height(btn, BT_ROW_H);
         lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_set_style_pad_top(btn, 7, 0);
         lv_obj_t *label = lv_obj_get_child(btn, 0);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(label, lv_color_black(), 0);
@@ -140,6 +141,7 @@ static void bt_refresh_list(void)
         lv_obj_set_height(btn, BT_ROW_H);
         lv_obj_set_style_pad_all(btn, 0, 0);
         lv_obj_set_style_pad_left(btn, 8, 0);
+        lv_obj_set_style_pad_top(btn, 7, 0);
 
         lv_obj_t *label = lv_obj_get_child(btn, 0);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
@@ -199,6 +201,7 @@ static void bt_list_open(void)
     lv_obj_set_style_bg_opa(s_bt_list, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_bt_list, 0, 0);
     lv_obj_set_style_pad_all(s_bt_list, 0, 0);
+    lv_obj_set_style_pad_top(s_bt_list, 8, 0);
 
     s_bt_card = lv_obj_create(s_bt_cont);
     lv_obj_set_pos(s_bt_card, 12, 40);

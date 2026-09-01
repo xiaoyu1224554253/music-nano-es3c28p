@@ -27,6 +27,9 @@ void sdmmc_disk_init(void);
 void sdmmc_disk_deinit(void);
 bool sdmmc_disk_is_mounted(void);
 
+/* 手动触发重新扫描: 置位后由 sys_monitor 任务模拟"拔卡→插卡"走现有流程 */
+extern volatile bool g_sd_manual_rescan;
+
 typedef void (*sd_event_cb_t)(const char *event, void *user_data);
 void sdmmc_disk_set_event_callback(sd_event_cb_t cb, void *user_data);
 
@@ -34,6 +37,9 @@ void sys_monitor_init(void);
 
 /* 音乐文件扫描 (storage/music_scan.c): 生成缓存文件列表 */
 void music_scan_init(void);
+
+/* 强制全量扫描标志: 置位后 music_scan_init 忽略空间阈值, 用完自动清除 */
+extern volatile bool g_music_scan_force;
 
 extern volatile bool   g_sd_ready;
 extern volatile float  g_vbat;

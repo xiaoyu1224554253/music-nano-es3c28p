@@ -36,13 +36,14 @@
 #define SAMPLE_DELAY_MS 10
 #define SENSOR_INTERVAL_TICKS 25
 
-#define CPU_TEMP_OFFSET_C  30.0f
+#define CPU_TEMP_OFFSET_C  20.0f
 #define MUSIC_CACHE        "/sdcard/.music_cache"
 #define FS_CACHE_MAGIC     0x4D555349
 
 volatile bool  g_sd_ready = false;
 volatile float g_vbat     = 0.0f;
 volatile float g_cpu_temp = 0.0f;
+volatile bool  g_sd_manual_rescan = false;
 fs_cache_t     *g_fs_cache     = NULL;
 
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
@@ -68,7 +69,7 @@ void fs_build_real_path(const char *group, const char *name,
     } else {
         snprintf(out, out_size, "/sdcard/%s/%s", rel, name);
         for (char *p = out; *p; p++) {
-            if (*p == '_') *p = '/';
+            if (*p == '%') *p = '/';
         }
     }
 }
@@ -435,6 +436,16 @@ static void sys_monitor_task(void *arg)
 
     while (1) {
         bool current = (gpio_get_level(PIN_SD_DETECT) == 1);
+
+        if (g_sd_manual_rescan) {
+            g_sd_manual_rescan = false;
+            ESP_LOGI(TAG_DETECT, "手动触发重新扫描");
+            g_music_scan_force = true;
+            sdmmc_disk_deinit();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            sdmmc_disk_init();
+            last = (gpio_get_level(PIN_SD_DETECT) == 1);
+        }
 
         if (last && !current) {
             ESP_LOGI(TAG_DETECT, "检测到 SD 卡插入");

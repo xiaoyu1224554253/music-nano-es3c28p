@@ -483,6 +483,11 @@ static uint8_t flac_get_channels(audio_decoder_t *iface)
     return ((decoder_flac_t *)iface)->channels;
 }
 
+static uint8_t flac_get_bits(audio_decoder_t *iface)
+{
+    return ((decoder_flac_t *)iface)->bits_per_sample;
+}
+
 /* 平均码率: file_size*8 / 时长 / 1000 */
 static uint32_t flac_get_bitrate(audio_decoder_t *iface)
 {
@@ -597,6 +602,7 @@ audio_decoder_t *decoder_flac_create(void)
     d->iface.close           = flac_close;
     d->iface.get_sample_rate = flac_get_sample_rate;
     d->iface.get_channels    = flac_get_channels;
+    d->iface.get_bits        = flac_get_bits;
     d->iface.get_bitrate     = flac_get_bitrate;
     d->iface.get_file_size   = flac_get_file_size;
     d->iface.get_position    = flac_get_position;

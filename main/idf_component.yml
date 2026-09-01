@@ -17,6 +17,8 @@ dependencies:
   lvgl/lvgl: ==8.3.11
   mydazy/esp_lcd_jd9853: ==2.0.0
   esphome/micro-mp3: ==0.4.0
-  bitbank2/jpegdec: ==1.6.2
-  esphome/esp-audio-libs: ==3.2.1
+  # 本地覆盖: 修复 JPEGDEC 对"三分量 1x2 采样"封面的支持 (managed_components 会被清空, 故放本地)
+  bitbank2/jpegdec:
+    version: ==1.6.2
+    override_path: ../third_party/jpegdec
   esphome/micro-flac: ==0.2.0

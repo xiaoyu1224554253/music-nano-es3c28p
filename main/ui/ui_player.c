@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "lvgl.h"
+#include "drv_display.h"
 #include "audio_task.h"
 #include "audio.h"
 #include "settings.h"
@@ -17,12 +18,14 @@
 #include "ui_core.h"
 #include "ui_player.h"
 #include "menu.h"
+#include "power_mgr.h"
 
 extern const lv_font_t lv_font_global_16;
 
 /* 音量按键: 高电平(外部下拉)即增减, 由 LVGL 独立定时器(10ms)轮询 */
 #define PIN_VOL_UP     36
 #define PIN_VOL_DOWN   38
+#define PIN_PWR_KEY    37                /* 息屏/唤醒按键 (GPIO37, 外部10k下拉) */
 #define VOLUME_STEP    8
 #define VOL_KEY_POLL_MS 10                /* 轮询周期 10ms */
 #define VOL_KEY_MIN_MS 100                /* 两次触发最小间隔 */
@@ -40,6 +43,37 @@ extern const lv_font_t lv_font_global_16;
 /* 用户命令发送: 与上一条间隔 < 500ms 则丢弃 */
 #define CMD_MIN_INTERVAL_US  500000
 
+/* ── 亮度抽屉: 左侧常驻容器, 收拢时只露灰条 (灰条贴容器右缘随容器移动) ── */
+#define BRI_PANEL_W     30              /* 面板宽度 (窄一点: 展开动画覆盖面积小, 减少重绘) */
+#define BRI_PANEL_H     150             /* 面板高度 */
+#define BRI_PANEL_Y     45              /* 面板(容器内局部) y */
+#define BRI_SLIDER_X    ((BRI_PANEL_W - 14) / 2)  /* 滑块(面板内局部) x (居中) */
+#define BRI_SLIDER_Y    14              /* 滑块(面板内局部) y (留出上缘, 防滑块头超出面板) */
+#define BRI_SLIDER_H    100             /* 滑块高 (缩短, 防顶部超出面板/底部压到数值) */
+#define BRI_BAR_W       5               /* 灰条宽度 (贴面板右缘) */
+#define BRI_BAR_X       (BRI_PANEL_W)   /* 灰条(容器内局部) x */
+#define BRI_BAR_Y       50              /* 灰条(容器内局部) y */
+#define BRI_BAR_H       80              /* 灰条高度 */
+#define BRI_BAR_R       2               /* 灰条圆角 */
+#define BRI_BTN_X       (BRI_PANEL_W)   /* 大触发按钮(容器内局部) x */
+#define BRI_BTN_Y       46              /* 大触发按钮(容器内局部) y (避开顶部菜单按钮) */
+#define BRI_BTN_W       20              /* 大触发按钮宽 (比灰条宽, 好点) */
+#define BRI_BTN_H       100             /* 大触发按钮高 */
+#define BRI_BTN_TUNE_CLR lv_color_hex(0xFF0000)  /* 仅供透明前临时占位, 可删 */
+#define BRI_DRAW_W      (BRI_PANEL_W + BRI_BTN_W)  /* 容器总宽 (必须包住整个大按钮, 否则超出的部分会被容器裁切) */
+#define BRI_DRAW_H      200             /* 容器总高 */
+#define BRI_ANIM_IN_MS  150             /* 弹出: overshoot 过冲 */
+#define BRI_ANIM_OUT_MS 300             /* 收回: 线性 */
+
+static lv_obj_t *s_bri_draw    = NULL;  /* 抽屉容器 (常驻) */
+static lv_obj_t *s_bri_slider  = NULL;
+static lv_obj_t *s_bri_val     = NULL;
+static lv_obj_t *s_bri_overlay = NULL;  /* 全屏透明按钮 (展开时存在) */
+static bool      s_bri_expanded = false;
+
+static void bri_open(void);
+static void bri_close(void);
+
 static lv_obj_t *s_status_label;
 static lv_obj_t *s_title_label;
 static lv_obj_t *s_artist_label;
@@ -48,7 +82,8 @@ static lv_obj_t *s_time_current;
 static lv_obj_t *s_time_total;
 static lv_obj_t *s_fmt_val;
 static lv_obj_t *s_sr_val;
-static lv_obj_t *s_bd_val;
+static lv_obj_t *s_ch_val;
+static lv_obj_t *s_bit_val;
 static lv_obj_t *s_album_art;
 static lv_obj_t *s_album_img;
 static lv_obj_t *s_album_icon;
@@ -82,6 +117,7 @@ static bool        s_was_playing = false;
 /* ── 文件不存在提示弹窗 ── */
 static lv_obj_t *s_dialog = NULL;
 static void show_file_not_found(void);
+static void player_info_reset(void);
 
 /* ── 播放列表辅助 ── */
 static int player_count_files(const char *group)
@@ -157,7 +193,12 @@ static void cover_clear(void)
 /* 封面: 让 img 控件指向解码任务给的 PSRAM 缓冲 (LVGL 不拷贝内存) */
 static void cover_show(void *buf)
 {
-    if (!s_album_img || !buf) return;
+    if (!s_album_img) return;
+    if (!buf) {
+        /* 新歌无内嵌封面: 回退默认图标 */
+        cover_clear();
+        return;
+    }
     s_cover_dsc.data = buf;
     lv_img_set_src(s_album_img, &s_cover_dsc);
     lv_obj_clear_flag(s_album_img, LV_OBJ_FLAG_HIDDEN);
@@ -172,8 +213,6 @@ void player_show_cover(void *buf)
 static void player_play_index(int idx)
 {
     if (s_pl_count <= 0) return;
-
-    cover_clear();
 
     idx = (idx % s_pl_count + s_pl_count) % s_pl_count;
 
@@ -207,8 +246,6 @@ static void player_play_index(int idx)
 void player_advance(void)
 {
     if (s_pl_count <= 0) return;
-
-    cover_clear();
 
     int next;
     switch (s_play_mode) {
@@ -264,6 +301,9 @@ void player_on_file_not_found(void)
     if (s_auto_advancing) {
         player_advance();
     } else {
+        cover_clear();
+        atomic_store_bool(&g_song_info_valid, false);
+        player_info_reset();
         show_file_not_found();
     }
 }
@@ -319,13 +359,13 @@ void player_play_file(const char *group, const char *name)
     player_play_index(found);
 }
 
-static void player_next(void)
+void player_next(void)
 {
     if (s_pl_count <= 0) return;
     player_play_index(s_pl_index + 1);
 }
 
-static void player_prev(void)
+void player_prev(void)
 {
     if (s_pl_count <= 0) return;
     player_play_index(s_pl_index - 1);
@@ -334,8 +374,8 @@ static void player_prev(void)
 static void player_prev_click_cb(lv_event_t *e) { player_prev(); }
 static void player_next_click_cb(lv_event_t *e) { player_next(); }
 
-/* 播放/暂停切换 */
-static void play_btn_click_cb(lv_event_t *e)
+/* 播放/暂停切换: 播放→暂停, 有歌续播, 无歌播当前项 (播放键 + 蓝牙耳机共用) */
+void player_toggle_play(void)
 {
     if (atomic_load_bool(&g_pcm_active)) {
         audio_cmd_t cmd;
@@ -363,12 +403,20 @@ static void play_btn_click_cb(lv_event_t *e)
     }
 }
 
-static void dialog_close_cb(lv_event_t *e)
+static void play_btn_click_cb(lv_event_t *e)
+{
+    player_toggle_play();
+}
+
+/* 确认: 关弹窗 + 请求重新扫描 (走 sys_monitor 拔卡→插卡现有流程) */
+static void dialog_rescan_cb(lv_event_t *e)
 {
     if (s_dialog) {
         lv_obj_del(s_dialog);
         s_dialog = NULL;
     }
+    g_sd_manual_rescan = true;
+    printf("[LVGL] 请求重新扫描\n");
 }
 
 static void show_file_not_found(void)
@@ -388,20 +436,21 @@ static void show_file_not_found(void)
     lv_obj_clear_flag(s_dialog, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *lbl = lv_label_create(s_dialog);
-    lv_label_set_text(lbl, "该文件不存在");
+    lv_label_set_text(lbl, "该文件不存在\n需重新扫描");
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(lbl, &lv_font_global_16, 0);
     lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
-    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 14);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, -10);
 
     lv_obj_t *btn = lv_btn_create(s_dialog);
     lv_obj_set_size(btn, 64, 30);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, 7);
     lv_obj_set_style_radius(btn, 6, 0);
     lv_obj_set_style_bg_color(btn, COLOR_ACCENT, 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(btn, 0, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
-    lv_obj_add_event_cb(btn, dialog_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(btn, dialog_rescan_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *btn_lbl = lv_label_create(btn);
     lv_label_set_text(btn_lbl, "确认");
@@ -426,6 +475,20 @@ static void progress_slider_cb(lv_event_t *e)
     printf("[LVGL] SEEK: %" PRIu32 "%%\n", cmd.param / 10);
 }
 
+/* 无有效歌曲信息: 恢复占位文本 + 进度清零 */
+static void player_info_reset(void)
+{
+    lv_label_set_text(s_title_label, "标题");
+    lv_label_set_text(s_artist_label, "作者");
+    lv_label_set_text(s_fmt_val, "");
+    lv_label_set_text(s_sr_val, "");
+    lv_label_set_text(s_ch_val, "");
+    lv_label_set_text(s_bit_val, "");
+    lv_label_set_text(s_time_current, "0:00");
+    lv_label_set_text(s_time_total, "0:00");
+    lv_slider_set_value(s_progress_slider, 0, LV_ANIM_OFF);
+}
+
 /* ── 歌曲信息轮询: 读 g_song_info 更新标签/进度 ── */
 static void song_info_monitor_cb(lv_timer_t *timer)
 {
@@ -441,10 +504,26 @@ static void song_info_monitor_cb(lv_timer_t *timer)
         lv_label_set_text(s_fmt_val, g_song_info.format);
 
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.1fk", (double)g_song_info.sample_rate / 1000.0);
+        /* 采样率: 整除1000 → "48k", 否则 "44.1k" */
+        if (g_song_info.sample_rate % 1000 == 0) {
+            snprintf(buf, sizeof(buf), "%" PRIu32 "k", g_song_info.sample_rate / 1000);
+        } else {
+            snprintf(buf, sizeof(buf), "%.1fk", (double)g_song_info.sample_rate / 1000.0);
+        }
         lv_label_set_text(s_sr_val, buf);
-        snprintf(buf, sizeof(buf), "%" PRIu32 "k", g_song_info.bitrate_kbps);
-        lv_label_set_text(s_bd_val, buf);
+
+        /* 声道 */
+        lv_label_set_text(s_ch_val,
+                          g_song_info.channels == 2 ? "2ch" :
+                          (g_song_info.channels == 1 ? "1ch" : " "));
+
+        /* 右下: MP3 → 码率, FLAC/WAV → 位深 */
+        if (strcmp(g_song_info.format, "MP3") == 0) {
+            snprintf(buf, sizeof(buf), "%" PRIu32 "k", g_song_info.bitrate_kbps);
+        } else {
+            snprintf(buf, sizeof(buf), "%ubit", g_song_info.bits_per_sample);
+        }
+        lv_label_set_text(s_bit_val, buf);
 
         uint32_t cur = g_song_info.elapsed_sec;
         uint32_t tot = g_song_info.duration_sec;
@@ -461,14 +540,7 @@ static void song_info_monitor_cb(lv_timer_t *timer)
             }
         }
     } else {
-        lv_label_set_text(s_title_label, "标题");
-        lv_label_set_text(s_artist_label, "作者");
-        lv_label_set_text(s_fmt_val, "");
-        lv_label_set_text(s_sr_val, "");
-        lv_label_set_text(s_bd_val, "");
-        lv_label_set_text(s_time_current, "0:00");
-        lv_label_set_text(s_time_total, "0:00");
-        lv_slider_set_value(s_progress_slider, 0, LV_ANIM_OFF);
+        player_info_reset();
     }
 }
 
@@ -636,10 +708,13 @@ static void volume_monitor_cb(lv_timer_t *timer)
     volume_save_to_nvs();
 }
 
-/* 音量按键轮询 (10ms): 高电平触发增减, 两次触发间隔不小于100ms
- * 之前放在 sys_monitor(10Hz) 会漏掉 <100ms 的短按, 移入 LVGL 用 10ms 轮询 */
-static void vol_key_poll_cb(lv_timer_t *timer)
+/* 按键轮询 (10ms): 息屏/唤醒键(上升沿) + 音量键增减.
+ * 之前放在 sys_monitor(10Hz) 会漏掉 <100ms 的短按, 移入 LVGL 用 10ms 轮询.
+ * 息屏键采样放最前(不受音量 100ms 节流影响), 由 power_mgr 做上升沿检测 */
+static void btn_key_poll_cb(lv_timer_t *timer)
 {
+    power_mgr_poll_key(gpio_get_level(PIN_PWR_KEY) == 1);
+
     static int64_t s_vol_key_last_us = 0;
 
     int64_t now = esp_timer_get_time();
@@ -660,7 +735,189 @@ static void vol_key_init(void)
 {
     gpio_set_direction(PIN_VOL_UP, GPIO_MODE_INPUT);
     gpio_set_direction(PIN_VOL_DOWN, GPIO_MODE_INPUT);
-    lv_timer_create(vol_key_poll_cb, VOL_KEY_POLL_MS, NULL);
+    lv_timer_create(btn_key_poll_cb, VOL_KEY_POLL_MS, NULL);
+}
+
+/* ── 亮度抽屉 ── */
+
+/* 滑块: 拖动实时改亮度, 松手存 NVS */
+static void bri_slider_cb(lv_event_t *e)
+{
+    lv_obj_t *sl = lv_event_get_target(e);
+    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
+        uint8_t v = (uint8_t)lv_slider_get_value(sl);
+        lcd_set_brightness(v);
+        brightness_set(v);
+        power_mgr_set_cur_bri(v);
+        lv_label_set_text_fmt(s_bri_val, "%d", (int)v);
+    } else if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        brightness_save_to_nvs();
+    }
+}
+
+static void bri_draw_set_x(void *obj, int32_t x)
+{
+    lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)x);
+}
+
+/* 收起完成: 注销全屏透明按钮, 抽屉回到收拢态只露灰条 */
+static void bri_close_end(lv_anim_t *a)
+{
+    if (s_bri_overlay) {
+        lv_obj_del(s_bri_overlay);
+        s_bri_overlay = NULL;
+    }
+    brightness_save_to_nvs();
+}
+
+/* 收起: 抽屉滑回屏外 */
+static void bri_close(void)
+{
+    if (!s_bri_expanded) return;
+    s_bri_expanded = false;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_bri_draw);
+    lv_anim_set_exec_cb(&a, bri_draw_set_x);
+    lv_anim_set_values(&a, 0, -BRI_PANEL_W);
+    lv_anim_set_time(&a, BRI_ANIM_OUT_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);   /* 回缩: 先慢后快 */
+    lv_anim_set_ready_cb(&a, bri_close_end);
+    lv_anim_start(&a);
+}
+
+/* 全屏透明按钮: 点容器外任意处 → 收起 */
+static void bri_overlay_click_cb(lv_event_t *e)
+{
+    bri_close();
+}
+
+/* 弹出: 创建全屏透明按钮 → 亮度容器置顶 → 滑出 */
+static void bri_open(void)
+{
+    if (s_bri_expanded) return;
+    s_bri_expanded = true;
+
+    if (!s_bri_overlay) {
+        s_bri_overlay = lv_btn_create(lv_scr_act());
+        lv_obj_set_pos(s_bri_overlay, 0, 0);
+        lv_obj_set_size(s_bri_overlay, TFT_HOR_RES, TFT_VER_RES);
+        lv_obj_set_style_bg_opa(s_bri_overlay, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(s_bri_overlay, 0, 0);
+        lv_obj_set_style_shadow_width(s_bri_overlay, 0, 0);
+        lv_obj_clear_flag(s_bri_overlay, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(s_bri_overlay, bri_overlay_click_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    /* 亮度容器置顶: 压过透明按钮, 保证面板可操作 */
+    lv_obj_move_foreground(s_bri_draw);
+
+    /* 刷新当前亮度到滑块/标签 */
+    lv_slider_set_value(s_bri_slider, brightness_get(), LV_ANIM_OFF);
+    lv_label_set_text_fmt(s_bri_val, "%d", (int)brightness_get());
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_bri_draw);
+    lv_anim_set_exec_cb(&a, bri_draw_set_x);
+    lv_anim_set_values(&a, -BRI_PANEL_W, 0);
+    lv_anim_set_time(&a, BRI_ANIM_IN_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
+    lv_anim_start(&a);
+}
+
+/* 大触发按钮: 收拢时点击弹出, 展开时点击收回 */
+static void bri_btn_click_cb(lv_event_t *e)
+{
+    if (s_bri_expanded) {
+        bri_close();
+    } else {
+        bri_open();
+    }
+}
+
+/* 创建亮度抽屉 (常驻, 初始收拢: 容器 x=-BRI_PANEL_W, 只露灰条在屏幕左缘 x=0..5) */
+static void bri_draw_create(void)
+{
+    s_bri_draw = lv_obj_create(lv_scr_act());
+    lv_obj_set_pos(s_bri_draw, -BRI_PANEL_W, 0);
+    lv_obj_set_size(s_bri_draw, BRI_DRAW_W, BRI_DRAW_H);
+    lv_obj_set_style_bg_opa(s_bri_draw, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_bri_draw, 0, 0);
+    lv_obj_set_style_radius(s_bri_draw, 0, 0);
+    lv_obj_set_style_pad_all(s_bri_draw, 0, 0);
+    lv_obj_clear_flag(s_bri_draw, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(s_bri_draw, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_scrollbar_mode(s_bri_draw, LV_SCROLLBAR_MODE_OFF);
+
+    /* 白色面板 (亮度容器): 点击内部不落到透明按钮 */
+    lv_obj_t *panel = lv_obj_create(s_bri_draw);
+    lv_obj_set_pos(panel, 0, BRI_PANEL_Y);
+    lv_obj_set_size(panel, BRI_PANEL_W, BRI_PANEL_H);
+    lv_obj_set_style_bg_color(panel, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(panel, 6, 0);
+    lv_obj_set_style_border_width(panel, 0, 0);
+    lv_obj_set_style_shadow_width(panel, 0, 0);
+    lv_obj_set_style_pad_all(panel, 0, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 竖向亮度滑块 (高>宽自动竖排), range 1~255 */
+    s_bri_slider = lv_slider_create(panel);
+    lv_obj_set_pos(s_bri_slider, BRI_SLIDER_X, BRI_SLIDER_Y);
+    lv_obj_set_size(s_bri_slider, 14, BRI_SLIDER_H);
+    lv_slider_set_range(s_bri_slider, BRIGHTNESS_MIN, BRIGHTNESS_MAX);
+    lv_slider_set_value(s_bri_slider, brightness_get(), LV_ANIM_OFF);
+    lv_obj_set_style_radius(s_bri_slider, 7, 0);
+    lv_obj_set_style_radius(s_bri_slider, 7, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_bri_slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(s_bri_slider, lv_color_hex(0xE0E0E0), 0);
+    lv_obj_set_style_bg_opa(s_bri_slider, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_bri_slider, COLOR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_bri_slider, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_bri_slider, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(s_bri_slider, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_border_color(s_bri_slider, COLOR_ACCENT, LV_PART_KNOB);
+    lv_obj_set_style_border_width(s_bri_slider, 2, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(s_bri_slider, 0, LV_PART_KNOB);
+    lv_obj_set_style_transform_width(s_bri_slider, 2, LV_PART_KNOB);
+    lv_obj_set_style_transform_height(s_bri_slider, 2, LV_PART_KNOB);
+    lv_obj_add_event_cb(s_bri_slider, bri_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_bri_slider, bri_slider_cb, LV_EVENT_RELEASED, NULL);
+
+    /* 亮度数值标签 */
+    s_bri_val = lv_label_create(panel);
+    lv_obj_set_pos(s_bri_val, 0, BRI_PANEL_H - 18);
+    lv_obj_set_size(s_bri_val, BRI_PANEL_W, 16);
+    lv_obj_set_style_text_align(s_bri_val, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(s_bri_val, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_bri_val, lv_color_black(), 0);
+    lv_label_set_text_fmt(s_bri_val, "%d", (int)brightness_get());
+
+    /* 灰条 (纯提示: 告诉用户点哪里, 不接收点击; 深色低对比 + 圆角) */
+    lv_obj_t *bar = lv_obj_create(s_bri_draw);
+    lv_obj_set_pos(bar, BRI_BAR_X, BRI_BAR_Y);
+    lv_obj_set_size(bar, BRI_BAR_W, BRI_BAR_H);
+    lv_obj_set_style_radius(bar, BRI_BAR_R, 0);
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_shadow_width(bar, 0, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 大触发按钮 (透明: 点击区域比灰条大, 收拢时屏幕 x≈0..20 / y=46..146 都能点到) */
+    lv_obj_t *btn = lv_btn_create(s_bri_draw);
+    lv_obj_set_pos(btn, BRI_BTN_X, BRI_BTN_Y);
+    lv_obj_set_size(btn, BRI_BTN_W, BRI_BTN_H);
+    lv_obj_set_style_radius(btn, 0, 0);
+    lv_obj_set_style_bg_color(btn, BRI_BTN_TUNE_CLR, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(btn, bri_btn_click_cb, LV_EVENT_CLICKED, NULL);
 }
 
 /* ── 主界面构建 ── */
@@ -880,27 +1137,34 @@ void ui_player_init(void)
     mode_update_icon();
     lv_obj_add_event_cb(mode_btn, mode_btn_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* ── 技术参数信息 (右侧三列) ── */
-    /* 格式 */
+    /* ── 技术参数信息 (右侧 2x2) ── */
+    /* 左上: 格式 */
     s_fmt_val = lv_label_create(panel);
-    lv_obj_set_pos(s_fmt_val, 52, 14);
+    lv_obj_set_pos(s_fmt_val, 50, 4);
     lv_obj_set_style_text_font(s_fmt_val, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_fmt_val, COLOR_ACCENT, 0);
     lv_label_set_text(s_fmt_val, "");
 
-    /* 采样率 */
+    /* 右上: 采样率 */
     s_sr_val = lv_label_create(panel);
-    lv_obj_set_pos(s_sr_val, 92, 14);
+    lv_obj_set_pos(s_sr_val, 105, 4);
     lv_obj_set_style_text_font(s_sr_val, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_sr_val, COLOR_FG, 0);
     lv_label_set_text(s_sr_val, "");
 
-    /* 位深 */
-    s_bd_val = lv_label_create(panel);
-    lv_obj_set_pos(s_bd_val, 128, 14);
-    lv_obj_set_style_text_font(s_bd_val, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_bd_val, COLOR_FG, 0);
-    lv_label_set_text(s_bd_val, "");
+    /* 左下: 声道 */
+    s_ch_val = lv_label_create(panel);
+    lv_obj_set_pos(s_ch_val, 50, 21);
+    lv_obj_set_style_text_font(s_ch_val, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_ch_val, COLOR_FG, 0);
+    lv_label_set_text(s_ch_val, "");
+
+    /* 右下: MP3 码率 / FLAC-WAV 位深 */
+    s_bit_val = lv_label_create(panel);
+    lv_obj_set_pos(s_bit_val, 105, 21);
+    lv_obj_set_style_text_font(s_bit_val, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_bit_val, COLOR_FG, 0);
+    lv_label_set_text(s_bit_val, "");
 
     lv_timer_create(fs_sd_monitor_cb, 50, NULL);
     lv_timer_create(song_info_monitor_cb, 500, NULL);
@@ -908,4 +1172,5 @@ void ui_player_init(void)
     vol_key_init();
 
     vol_popup_create();
+    bri_draw_create();
 }

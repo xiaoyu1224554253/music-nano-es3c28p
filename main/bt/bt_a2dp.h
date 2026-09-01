@@ -39,6 +39,9 @@ typedef enum {
     BT_EVT_STREAM_READY    = 5,
     BT_EVT_STREAM_STOPPED  = 6,
     BT_EVT_STATE_RSP       = 7,
+    BT_EVT_PLAY_PAUSE      = 8,  /* 耳机切换 播放/暂停 */
+    BT_EVT_TRANSPORT_NEXT  = 9,  /* 耳机下一曲 */
+    BT_EVT_TRANSPORT_PREV  = 10, /* 耳机上一曲 */
 } bt_evt_type_t;
 
 typedef struct {

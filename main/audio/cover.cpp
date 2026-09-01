@@ -16,6 +16,20 @@ void JPEG_close(JPEGIMAGE *pJPEG);
 void JPEG_setPixelType(JPEGIMAGE *pJPEG, int iType);
 int JPEG_getWidth(JPEGIMAGE *pJPEG);
 int JPEG_getHeight(JPEGIMAGE *pJPEG);
+int JPEG_getLastError(JPEGIMAGE *pJPEG);
+}
+
+/* JPEG 错误码 → 字符串 (见 JPEGDEC.h 错误枚举) */
+static const char *jpeg_err_str(int err)
+{
+    switch (err) {
+    case 0: return "OK";
+    case 1: return "INVALID_PARAMETER";
+    case 2: return "DECODE_ERROR";
+    case 3: return "UNSUPPORTED_FEATURE";
+    case 4: return "INVALID_FILE";
+    default: return "UNKNOWN";
+    }
 }
 
 #define COVER_TAG         "COVER"
@@ -43,18 +57,30 @@ static uint16_t *s_raw = NULL;      /* 解码中间缓冲 (PSRAM, 临时) */
 static int       s_raw_w = 0;
 static int       s_raw_h = 0;
 
-/* JPEG 解码回调: 把 MCU 块拷进中间缓冲 */
+/* JPEG 解码回调: 把 MCU 块拷进中间缓冲 (右边缘用 iWidthUsed, 并钳制到缓冲边界) */
 static int cover_jpeg_draw(JPEGDRAW *pDraw)
 {
     if (!s_raw) return 0;
 
-    uint16_t *dest = s_raw + (size_t)pDraw->y * s_raw_w + pDraw->x;
-    const uint16_t *src = pDraw->pPixels;
+    /* JPEGDEC 右边缘只裁 iWidthUsed, iWidth 保留整块宽 → 必须用 iWidthUsed 拷宽 */
+    int w = pDraw->iWidthUsed;
     int h = pDraw->iHeight;
+    int x = pDraw->x;
+    int y = pDraw->y;
+    if (w <= 0 || h <= 0) return 1;
+
+    /* 防御性钳制: 任何越界都截断, 杜绝写穿 s_raw */
+    if (x >= s_raw_w || y >= s_raw_h) return 1;
+    if (x + w > s_raw_w) w = s_raw_w - x;
+    if (y + h > s_raw_h) h = s_raw_h - y;
+    if (w <= 0 || h <= 0) return 1;
+
+    uint16_t *dest = s_raw + (size_t)y * s_raw_w + x;
+    const uint16_t *src = pDraw->pPixels;
     while (h-- > 0) {
-        memcpy(dest, src, (size_t)pDraw->iWidth * sizeof(uint16_t));
+        memcpy(dest, src, (size_t)w * sizeof(uint16_t));
         dest += s_raw_w;
-        src  += pDraw->iWidth;
+        src  += (size_t)pDraw->iWidthUsed;
     }
     return 1;
 }
@@ -117,12 +143,70 @@ static void cover_swap_rgb565(uint16_t *buf, int n)
     }
 }
 
+/* 用指定缩放选项解码一次: 成功返回 1 (已缩放写入 s_out_buf), 失败返回 0 */
+static int cover_decode_attempt(int opt, int w, int h)
+{
+    int rw = w, rh = h;
+    if (opt == JPEG_SCALE_EIGHTH)       { rw = w / 8; rh = h / 8; }
+    else if (opt == JPEG_SCALE_QUARTER) { rw = w / 4; rh = h / 4; }
+    else if (opt == JPEG_SCALE_HALF)    { rw = w / 2; rh = h / 2; }
+
+    /* +16 边缘缓冲, 避免 MCU 块越界 */
+    size_t raw_bytes = (size_t)(rw + 16) * (rh + 16) * sizeof(uint16_t);
+    uint16_t *raw = (uint16_t *)heap_caps_malloc(raw_bytes, MALLOC_CAP_SPIRAM);
+    if (!raw) {
+        ESP_LOGW(COVER_TAG, "中间缓冲分配失败 (%u KB)", (unsigned)(raw_bytes / 1024));
+        JPEG_close(s_jpeg);
+        return 0;
+    }
+    s_raw = raw;
+    s_raw_w = rw;
+    s_raw_h = rh;
+
+    JPEG_setPixelType(s_jpeg, RGB565_LITTLE_ENDIAN);
+    uint8_t mode = s_jpeg->ucMode;
+    uint8_t comp = s_jpeg->ucNumComponents;
+    int rc = JPEG_decode(s_jpeg, 0, 0, opt);
+    int err = JPEG_getLastError(s_jpeg);
+    JPEG_close(s_jpeg);
+    s_raw = NULL;
+
+    if (rc != 1) {
+        ESP_LOGW(COVER_TAG, "解码失败 rc=%d err=%d (%s) %dx%d mode=0x%02x comp=%u opt=%d",
+                 rc, err, jpeg_err_str(err), w, h, mode, comp, opt);
+        heap_caps_free(raw);
+        return 0;
+    }
+
+    cover_scale_crop_to_100(raw, rw, rh);
+    heap_caps_free(raw);
+    return 1;
+}
+
+/* 通知 UI 封面结果: ok=true 传 s_out_buf, ok=false 传 NULL (UI 显示默认图标) */
+static void cover_send_result(bool ok)
+{
+    if (!s_app_cmd_queue) return;
+    app_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = APP_CMD_COVER_READY;
+    void *buf = ok ? (void *)s_out_buf : NULL;
+    memcpy(cmd.param, &buf, sizeof(buf));
+    xQueueSend(s_app_cmd_queue, &cmd, 0);
+}
+
 static void cover_decode_job(const uint8_t *data, size_t size)
 {
-    if (!s_out_buf || !s_jpeg || !data || size == 0) return;
+    if (!s_out_buf || !s_jpeg || !data || size == 0) {
+        cover_send_result(false);
+        return;
+    }
 
-    if (JPEG_openRAM(s_jpeg, (uint8_t *)data, (int)size, cover_jpeg_draw) != 1) {
-        ESP_LOGW(COVER_TAG, "openRAM 失败");
+    int rc_open = JPEG_openRAM(s_jpeg, (uint8_t *)data, (int)size, cover_jpeg_draw);
+    if (rc_open != 1) {
+        int err = JPEG_getLastError(s_jpeg);
+        ESP_LOGW(COVER_TAG, "openRAM 失败 rc=%d err=%d (%s)", rc_open, err, jpeg_err_str(err));
+        cover_send_result(false);
         return;
     }
 
@@ -130,6 +214,7 @@ static void cover_decode_job(const uint8_t *data, size_t size)
     if (s_jpeg->ucMode == 0xc2) {
         ESP_LOGW(COVER_TAG, "渐进式 JPEG, 跳过封面");
         JPEG_close(s_jpeg);
+        cover_send_result(false);
         return;
     }
 
@@ -137,54 +222,46 @@ static void cover_decode_job(const uint8_t *data, size_t size)
     int h = JPEG_getHeight(s_jpeg);
     if (w <= 0 || h <= 0) {
         JPEG_close(s_jpeg);
+        cover_send_result(false);
         return;
     }
+    ESP_LOGI(COVER_TAG, "封面 %dx%d mode=0x%02x comp=%u", w, h,
+             s_jpeg->ucMode, s_jpeg->ucNumComponents);
 
-    int opt = 0, rw = w, rh = h;
+    int opt = 0;
     if (w / 8 >= COVER_SIZE && h / 8 >= COVER_SIZE) {
-        opt = JPEG_SCALE_EIGHTH; rw = w / 8; rh = h / 8;
+        opt = JPEG_SCALE_EIGHTH;
     } else if (w / 4 >= COVER_SIZE && h / 4 >= COVER_SIZE) {
-        opt = JPEG_SCALE_QUARTER; rw = w / 4; rh = h / 4;
+        opt = JPEG_SCALE_QUARTER;
     } else if (w / 2 >= COVER_SIZE && h / 2 >= COVER_SIZE) {
-        opt = JPEG_SCALE_HALF; rw = w / 2; rh = h / 2;
+        opt = JPEG_SCALE_HALF;
     }
 
-    /* +16 边缘缓冲, 避免 MCU 块越界 */
-    size_t raw_bytes = (size_t)(rw + 16) * (rh + 16) * sizeof(uint16_t);
-    uint16_t *raw = (uint16_t *)heap_caps_malloc(raw_bytes, MALLOC_CAP_SPIRAM);
-    if (!raw) {
-        ESP_LOGW(COVER_TAG, "中间缓冲分配失败");
-        JPEG_close(s_jpeg);
+    int ok = cover_decode_attempt(opt, w, h);
+    if (!ok && opt != 0) {
+        /* 缩放解码失败 → 回退全量解码, 由 cover_scale_crop_to_100 负责缩放 */
+        ESP_LOGW(COVER_TAG, "缩放解码失败, 回退全量解码");
+        rc_open = JPEG_openRAM(s_jpeg, (uint8_t *)data, (int)size, cover_jpeg_draw);
+        if (rc_open != 1) {
+            int err = JPEG_getLastError(s_jpeg);
+            ESP_LOGW(COVER_TAG, "重开 openRAM 失败 rc=%d err=%d (%s)", rc_open, err, jpeg_err_str(err));
+            cover_send_result(false);
+            return;
+        }
+        if (s_jpeg->ucMode == 0xc2) {
+            JPEG_close(s_jpeg);
+            cover_send_result(false);
+            return;
+        }
+        ok = cover_decode_attempt(0, w, h);
+    }
+    if (!ok) {
+        cover_send_result(false);
         return;
     }
-    s_raw = raw;
-    s_raw_w = rw;
-    s_raw_h = rh;
-
-    JPEG_setPixelType(s_jpeg, RGB565_LITTLE_ENDIAN);
-    int rc = JPEG_decode(s_jpeg, 0, 0, opt);
-    JPEG_close(s_jpeg);
-    s_raw = NULL;
-
-    if (rc != 1) {
-        ESP_LOGW(COVER_TAG, "解码失败");
-        heap_caps_free(raw);
-        return;
-    }
-
-    cover_scale_crop_to_100(raw, rw, rh);
-    heap_caps_free(raw);
 
     cover_swap_rgb565(s_out_buf, COVER_PIXELS);
-
-    if (s_app_cmd_queue) {
-        app_cmd_t cmd;
-        memset(&cmd, 0, sizeof(cmd));
-        cmd.type = APP_CMD_COVER_READY;
-        void *buf = s_out_buf;
-        memcpy(cmd.param, &buf, sizeof(buf));
-        xQueueSend(s_app_cmd_queue, &cmd, 0);
-    }
+    cover_send_result(true);
 }
 
 static void cover_task(void *arg)
@@ -245,4 +322,9 @@ void cover_submit_job(const uint8_t *jpg, size_t size)
     xSemaphoreGive(s_slot_mutex);
 
     xSemaphoreGive(s_job_sem);
+}
+
+void cover_notify_no_cover(void)
+{
+    cover_send_result(false);
 }

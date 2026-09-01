@@ -3,10 +3,14 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 #include "lvgl.h"
 #include "drv_display.h"
 #include "ui_core.h"
 #include "settings.h"
+
+#define TAG "ui_core"
 
 #define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 10 * 7)
 #define LVGL_BUF_SIZE  (DRAW_BUF_SIZE / 2)
@@ -27,6 +31,9 @@ static lv_disp_drv_t        s_disp_drv;
 static lv_indev_drv_t       s_indev_drv;   /* LVGL 8 只存指针不拷贝, 必须常驻 */
 static esp_lcd_panel_handle_t s_panel = NULL;
 
+/* 触摸开关: 息屏时置 false, touch_read_cb 短路返回 (顺带省 I2C 功耗) */
+static volatile bool s_touch_enabled = true;
+
 static void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area,
                           lv_color_t *color_p)
 {
@@ -35,8 +42,18 @@ static void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area,
     lv_disp_flush_ready(disp_drv);
 }
 
+void ui_touch_set_enabled(bool enable)
+{
+    s_touch_enabled = enable;
+}
+
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
+    if (!s_touch_enabled) {
+        data->state = LV_INDEV_STATE_REL;
+        return;
+    }
+
     uint16_t tx, ty;
     if (touch_read(&tx, &ty)) {
         ty = (uint16_t)(((int)ty - TOUCH_Y_MIN) * (TFT_VER_RES - 1)
@@ -78,7 +95,7 @@ void ui_core_display_init(void)
 {
     lv_init();
 
-    s_panel = lcd_init(SPI2_HOST);
+    s_panel = lcd_get_panel();
     touch_init();
 
     lv_disp_draw_buf_init(&s_draw_buf_dsc, s_draw_buf1, s_draw_buf2, LVGL_BUF_SIZE);
@@ -103,6 +120,7 @@ void ui_core_init(const ui_params_t *params)
     g_ui_audio_rsp_queue = params->audio_rsp_queue;
 
     volume_load_from_nvs();
+    brightness_load_from_nvs();
 
     xTaskCreatePinnedToCore(ui_loop_task, "lvgl", 8192, NULL, 1, NULL, 1);
 }

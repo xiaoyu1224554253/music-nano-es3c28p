@@ -4,6 +4,8 @@
 #include "freertos/queue.h"
 #include "nvs_flash.h"
 #include "app.h"
+#include "drv_display.h"
+#include "power_mgr.h"
 #include "ui_core.h"
 #include "audio_task.h"
 #include "bt_a2dp.h"
@@ -16,6 +18,10 @@ static QueueHandle_t s_audio_rsp_queue = NULL;
 
 void app_main(void)
 {
+    /* 最先: 开外设供电 + LCD 前半段 (SPI/面板/SLPOUT, 非阻塞), 让 120ms 在启动期间流逝 */
+    power_mgr_early_init();
+    lcd_init_early(SPI2_HOST);
+
     nvs_flash_init();
 
     s_app_cmd_queue  = xQueueCreate(10, sizeof(app_cmd_t));

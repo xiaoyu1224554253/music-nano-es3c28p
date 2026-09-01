@@ -17,6 +17,11 @@ void player_advance(void);
 void player_on_song_finished(void);
 void player_on_file_not_found(void);
 
+/* 播放/暂停切换 (播放键 + 蓝牙耳机请求共用) */
+void player_toggle_play(void);
+void player_next(void);
+void player_prev(void);
+
 /* 封面: 解码任务就绪后回调 */
 void player_show_cover(void *buf);
 

@@ -12,6 +12,9 @@ extern "C" {
 void cover_init(QueueHandle_t app_cmd_queue);
 void cover_submit_job(const uint8_t *jpg, size_t size);
 
+/* 通知 UI: 当前歌曲无内嵌封面, 回退默认图标 */
+void cover_notify_no_cover(void);
+
 #ifdef __cplusplus
 }
 #endif

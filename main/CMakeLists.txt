@@ -4,11 +4,15 @@ idf_component_register(SRCS "main.c"
                             "audio/audio_task.cpp"
                             "audio/decoder_mp3.cpp"
                             "audio/decoder_flac.cpp"
+                            "audio/decoder_wav.cpp"
                             "audio/pcm_pipeline.cpp"
+                            "audio/impl/pcm_convert.cpp"
+                            "audio/resampler_fxp.cpp"
                             "audio/cover.cpp"
                             "bt/bt_a2dp.c"
                             "storage/sys_monitor.c"
                             "storage/music_scan.c"
+                            "power/power_mgr.c"
                             "ui/ui_core.c"
                             "ui/ui_loop.c"
                             "ui/ui_player.c"
@@ -18,5 +22,5 @@ idf_component_register(SRCS "main.c"
                             "drivers/drv_display.c"
                             "resources/icon_file.c"
                             "resources/lv_font_global_16.c"
-                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp-audio-libs esp_adc esp_psram jpegdec
-                    INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources")
+                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec
+                    INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources" "power")

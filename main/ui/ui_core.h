@@ -51,6 +51,9 @@ void ui_core_display_init(void);
 /* LVGL 主循环 (ui_core_init 创建的任务主体, 定义于 ui_loop.c) */
 void ui_loop_task(void *arg);
 
+/* 触摸开关: 息屏时关闭 (touch_read_cb 短路, 不再读 I2C) */
+void ui_touch_set_enabled(bool enable);
+
 #ifdef __cplusplus
 }
 #endif

@@ -240,6 +240,12 @@ static uint8_t mp3_get_channels(audio_decoder_t *iface)
     return ((decoder_mp3_t *)iface)->channels;
 }
 
+/* MP3 位深固定 16bit */
+static uint8_t mp3_get_bits(audio_decoder_t *iface)
+{
+    return 16;
+}
+
 static uint32_t mp3_get_bitrate(audio_decoder_t *iface)
 {
     decoder_mp3_t *d = (decoder_mp3_t *)iface;
@@ -313,6 +319,7 @@ audio_decoder_t *decoder_mp3_create(void)
     d->iface.close           = mp3_close;
     d->iface.get_sample_rate = mp3_get_sample_rate;
     d->iface.get_channels    = mp3_get_channels;
+    d->iface.get_bits        = mp3_get_bits;
     d->iface.get_bitrate     = mp3_get_bitrate;
     d->iface.get_file_size   = mp3_get_file_size;
     d->iface.get_position    = mp3_get_position;

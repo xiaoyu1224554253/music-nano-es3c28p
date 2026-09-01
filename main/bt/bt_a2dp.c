@@ -27,9 +27,16 @@
 
 #define CACHE_MAX 16
 
+/* 连接后音量设置时序: 等 AVRC 连上 → 再等 VOL_SET_DELAY_MS → 发音量 → 放行 A2DP 流启动.
+ * 静音机制已删除: 窗口期流不启动, 到点先发音量再启流.
+ * VOL_WAIT_FALLBACK_MS: AVRC 迟迟连不上时的兜底超时, 防止永远不启流 */
+#define VOL_SET_DELAY_MS  500
+#define VOL_WAIT_FALLBACK_MS  3000
+
 typedef enum {
     BT_DISPATCH_A2DP,
     BT_DISPATCH_AVRC,
+    BT_DISPATCH_AVRC_TG,
 } bt_dispatch_type_t;
 
 typedef struct {
@@ -39,13 +46,19 @@ typedef struct {
 } bt_dispatch_msg_t;
 
 static bt_a2dp_iface_t s_iface;
-static SemaphoreHandle_t s_init_sem = NULL;
 static bool s_bt_ready = false;
 static bool s_connected = false;
 static bool s_scanning = false;
 static bool s_connecting = false;
 static bool s_stream_started = false;
 static esp_bd_addr_t s_peer_bda;
+
+/* 连接后音量时序: 等 AVRC 连上后延迟 VOL_SET_DELAY_MS 发音量, 期间禁止启动流 */
+static volatile bool s_pending_vol = false;
+static bool          s_avrc_connected = false;
+static int64_t       s_avrc_at_us  = 0;
+static int64_t       s_connect_at_us = 0;
+
 
 static uint8_t s_cache_count = 0;
 static esp_bd_addr_t s_cache_bda[CACHE_MAX];
@@ -204,11 +217,12 @@ static void bt_a2dp_hdl_avrc_evt(uint16_t event, void *p_param)
                  rc->conn_stat.connected, bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
         if (rc->conn_stat.connected) {
             esp_avrc_ct_send_get_rn_capabilities_cmd(APP_RC_CT_TL_GET_CAPS);
-            /* 连接后第一时间同步当前音量到耳机 */
-            int32_t v = volume_get();
-            s_last_sent_vol = v;
-            esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_GET_CAPS, (uint8_t)v);
+            /* AVRC 就绪: 记时间戳, 由连接时序延迟 VOL_SET_DELAY_MS 后统一发音量 */
+            s_avrc_connected = true;
+            s_avrc_at_us = esp_timer_get_time();
         } else {
+            s_avrc_connected = false;
+            s_avrc_at_us = 0;
             s_avrc_peer_rn_cap.bits = 0;
             s_last_sent_vol = -1;
         }
@@ -244,6 +258,46 @@ static void bt_a2dp_hdl_avrc_evt(uint16_t event, void *p_param)
         s_last_sent_vol = rc->set_volume_rsp.volume;
         break;
     }
+    default:
+        break;
+    }
+}
+
+/* ── AVRCP TG event handler (耳机发来的控制命令) ── */
+static void bt_a2dp_hdl_avrc_tg_evt(uint16_t event, void *p_param)
+{
+    esp_avrc_tg_cb_param_t *rc = (esp_avrc_tg_cb_param_t *)p_param;
+
+    switch (event) {
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+        ESP_LOGI(RC_TAG, "AVRC TG 连接状态: %d", rc->conn_stat.connected);
+        break;
+    case ESP_AVRC_TG_REMOTE_FEATURES_EVT:
+        ESP_LOGI(RC_TAG, "AVRC TG 远程功能: 0x%" PRIx32, rc->rmt_feats.feat_mask);
+        break;
+    case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
+        ESP_LOGI(RC_TAG, "AVRC passthrough cmd: key 0x%x state %d",
+                 rc->psth_cmd.key_code, rc->psth_cmd.key_state);
+        /* 只处理按下, 忽略抬起 (防 PRESS+RELEASE 双触发) */
+        if (rc->psth_cmd.key_state != 0) break;
+        switch (rc->psth_cmd.key_code) {
+        case ESP_AVRC_PT_CMD_PLAY:
+        case ESP_AVRC_PT_CMD_PAUSE:
+            ESP_LOGI(RC_TAG, "耳机请求 切换播放/暂停");
+            send_evt(BT_EVT_PLAY_PAUSE, NULL, 0);
+            break;
+        case ESP_AVRC_PT_CMD_FORWARD:
+            ESP_LOGI(RC_TAG, "耳机请求 下一曲");
+            send_evt(BT_EVT_TRANSPORT_NEXT, NULL, 0);
+            break;
+        case ESP_AVRC_PT_CMD_BACKWARD:
+            ESP_LOGI(RC_TAG, "耳机请求 上一曲");
+            send_evt(BT_EVT_TRANSPORT_PREV, NULL, 0);
+            break;
+        default:
+            break;
+        }
+        break;
     default:
         break;
     }
@@ -313,6 +367,12 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
             s_connected = true;
             s_connecting = false;
             s_stream_started = false;
+            memcpy(s_peer_bda, a2d->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
+            /* 进入音量待设窗口: 等 AVRC 连上后再延迟发音量, 期间不启动流 */
+            s_pending_vol = true;
+            s_avrc_connected = false;
+            s_avrc_at_us = 0;
+            s_connect_at_us = esp_timer_get_time();
             strncpy(s_connected_name, s_connecting_name,
                     sizeof(s_connected_name) - 1);
             s_connected_name[sizeof(s_connected_name) - 1] = '\0';
@@ -323,6 +383,10 @@ static void bt_a2dp_hdl_a2d_evt(uint16_t event, void *p_param)
             s_connected = false;
             s_connecting = false;
             s_stream_started = false;
+            s_pending_vol = false;
+            s_avrc_connected = false;
+            s_avrc_at_us = 0;
+            s_connect_at_us = 0;
             memset(s_connected_name, 0, sizeof(s_connected_name));
             memset(s_connecting_name, 0, sizeof(s_connecting_name));
             ESP_LOGI(BT_TAG, "A2DP 已断开连接");
@@ -494,6 +558,12 @@ static void bt_a2dp_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_
     bt_a2dp_send_dispatch(BT_DISPATCH_AVRC, event, param, sizeof(esp_avrc_ct_cb_param_t));
 }
 
+/* ── AVRCP TG callback -> dispatch to internal queue ── */
+static void bt_a2dp_rc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    bt_a2dp_send_dispatch(BT_DISPATCH_AVRC_TG, event, param, sizeof(esp_avrc_tg_cb_param_t));
+}
+
 /* ── Stack up handler ── */
 static void bt_a2dp_hdl_stack_up(void)
 {
@@ -503,6 +573,19 @@ static void bt_a2dp_hdl_stack_up(void)
 
     esp_avrc_ct_init();
     esp_avrc_ct_register_callback(bt_a2dp_rc_ct_cb);
+
+    esp_avrc_tg_init();
+    esp_avrc_tg_register_callback(bt_a2dp_rc_tg_cb);
+
+    /* 关键: TG 默认支持的 passthrough 命令集是全 0, 耳机发的 PLAY/PAUSE/上下曲
+     * 全被协议栈回 NOT_IMPL 且不产生回调, 必须显式开启 */
+    esp_avrc_psth_bit_mask_t psth = {0};
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_PLAY);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_PAUSE);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_STOP);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_FORWARD);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_BACKWARD);
+    esp_avrc_tg_set_psth_cmd_filter(ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD, &psth);
 
     esp_avrc_rn_evt_cap_mask_t evt_set = {0};
     esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_set, ESP_AVRC_RN_VOLUME_CHANGE);
@@ -515,15 +598,16 @@ static void bt_a2dp_hdl_stack_up(void)
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 
     s_bt_ready = true;
-    ESP_LOGI(BT_TAG, "蓝牙初始化完成");
+    ESP_LOGI(BT_TAG, "蓝牙初始化完成"); 
 }
 
 /* ── 未连接时排水: 以 44.1kHz/16bit/双声道 真实速率丢弃 PCM ── */
 #define DRAIN_BYTES_PER_SEC  (44100 * 2 * 2)
 
-/* 5Hz 轮询: 全局音量有变化则同步到耳机 */
+/* 5Hz 轮询: 全局音量有变化则同步到耳机 (音量待设窗口不推, 由连接时序统一在延迟后设置) */
 static void bt_sync_volume(void)
 {
+    if (s_pending_vol) return;
     int32_t v = volume_get();
     if (v != s_last_sent_vol) {
         s_last_sent_vol = v;
@@ -562,13 +646,11 @@ static void bt_a2dp_task(void *arg)
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     if (esp_bt_controller_init(&bt_cfg) != ESP_OK) {
         ESP_LOGE(BT_TAG, "蓝牙控制器初始化失败");
-        xSemaphoreGive(s_init_sem);
         vTaskDelete(NULL);
         return;
     }
     if (esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT) != ESP_OK) {
         ESP_LOGE(BT_TAG, "蓝牙控制器启用失败");
-        xSemaphoreGive(s_init_sem);
         vTaskDelete(NULL);
         return;
     }
@@ -577,13 +659,11 @@ static void bt_a2dp_task(void *arg)
     esp_err_t ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(BT_TAG, "Bluedroid 初始化失败: %s", esp_err_to_name(ret));
-        xSemaphoreGive(s_init_sem);
         vTaskDelete(NULL);
         return;
     }
     if (esp_bluedroid_enable() != ESP_OK) {
         ESP_LOGE(BT_TAG, "Bluedroid 启用失败");
-        xSemaphoreGive(s_init_sem);
         vTaskDelete(NULL);
         return;
     }
@@ -599,18 +679,8 @@ static void bt_a2dp_task(void *arg)
     char bda_str[18];
     ESP_LOGI(BT_TAG, "本机地址:[%s]", bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));
 
-    s_iface.cmd_queue  = xQueueCreate(10, sizeof(bt_cmd_t));
-    s_iface.evt_queue  = xQueueCreate(20, sizeof(bt_evt_t));
-    s_iface.pcm_stream = xStreamBufferCreate(24 * 1024, 512);
-
-    s_dispatch_queue = xQueueCreate(10, sizeof(bt_dispatch_msg_t));
-    s_queue_set      = xQueueCreateSet(8);
-    xQueueAddToSet(s_iface.cmd_queue, s_queue_set);
-    xQueueAddToSet(s_dispatch_queue, s_queue_set);
-
+    /* 接口句柄(队列/流/分发)已在 bt_a2dp_init 同步创建, 此处只做协议栈启动 */
     bt_a2dp_hdl_stack_up();
-
-    xSemaphoreGive(s_init_sem);
 
     bt_cmd_t          cmd;
     bt_dispatch_msg_t disp;
@@ -621,11 +691,30 @@ static void bt_a2dp_task(void *arg)
             active = xQueueSelectFromSet(s_queue_set, pdMS_TO_TICKS(200));
             bt_sync_volume();
             if (active == NULL) {
-                bool want = atomic_load_bool(&g_pcm_active);
-                if (want != s_stream_started) {
-                    esp_a2d_media_ctrl(want ? ESP_A2D_MEDIA_CTRL_START
-                                            : ESP_A2D_MEDIA_CTRL_SUSPEND);
-                    s_stream_started = want;
+                /* 连接时序: 等 AVRC 连上 → 再等 VOL_SET_DELAY_MS → 发音量 → 放行流启动.
+                 * 兜底: AVRC 超时 VOL_WAIT_FALLBACK_MS 仍未连上则照常继续 */
+                if (s_pending_vol) {
+                    int64_t now = esp_timer_get_time();
+                    bool ready = s_avrc_connected && s_avrc_at_us != 0 &&
+                                 (now - s_avrc_at_us) >= VOL_SET_DELAY_MS * 1000LL;
+                    bool fb = s_connect_at_us != 0 &&
+                              (now - s_connect_at_us) >= VOL_WAIT_FALLBACK_MS * 1000LL;
+                    if (ready || fb) {
+                        int32_t v = volume_get();
+                        s_last_sent_vol = v;
+                        esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_GET_CAPS, (uint8_t)v);
+                        ESP_LOGI(RC_TAG, "AVRC就绪后 %dms 发音量 %d, 放行流媒体启动",
+                                 VOL_SET_DELAY_MS, v);
+                        s_pending_vol = false;
+                    }
+                }
+                if (!s_pending_vol) {
+                    bool want = atomic_load_bool(&g_pcm_active);
+                    if (want != s_stream_started) {
+                        esp_a2d_media_ctrl(want ? ESP_A2D_MEDIA_CTRL_START
+                                                : ESP_A2D_MEDIA_CTRL_SUSPEND);
+                        s_stream_started = want;
+                    }
                 }
                 continue;
             }
@@ -742,6 +831,9 @@ static void bt_a2dp_task(void *arg)
             case BT_DISPATCH_AVRC:
                 bt_a2dp_hdl_avrc_evt(disp.event, disp.param);
                 break;
+            case BT_DISPATCH_AVRC_TG:
+                bt_a2dp_hdl_avrc_tg_evt(disp.event, disp.param);
+                break;
             }
 
             if (disp.param) {
@@ -753,26 +845,27 @@ static void bt_a2dp_task(void *arg)
 
 bt_a2dp_iface_t *bt_a2dp_init(void)
 {
-    s_init_sem = xSemaphoreCreateBinary();
-    if (!s_init_sem) {
+    /* 接口句柄同步创建: 让 app_main 立即返回, BT 控制器启动在后台与 LCD/UI 初始化重叠.
+     * 失败由任务内 ESP_LOGE 记录, UI 照常启动 */
+    s_iface.cmd_queue  = xQueueCreate(10, sizeof(bt_cmd_t));
+    s_iface.evt_queue  = xQueueCreate(20, sizeof(bt_evt_t));
+    s_iface.pcm_stream = xStreamBufferCreate(24 * 1024, 512);
+    if (!s_iface.cmd_queue || !s_iface.evt_queue || !s_iface.pcm_stream) {
         return NULL;
     }
 
-    BaseType_t result = xTaskCreatePinnedToCore(bt_a2dp_task, "bt_a2dp", 3072, NULL, 1, NULL, 0);
-    if (result != pdPASS) {
-        vSemaphoreDelete(s_init_sem);
-        s_init_sem = NULL;
+    s_dispatch_queue = xQueueCreate(10, sizeof(bt_dispatch_msg_t));
+    s_queue_set      = xQueueCreateSet(8);
+    if (!s_dispatch_queue || !s_queue_set) {
+        return NULL;
+    }
+    xQueueAddToSet(s_iface.cmd_queue, s_queue_set);
+    xQueueAddToSet(s_dispatch_queue, s_queue_set);
+
+    if (xTaskCreatePinnedToCore(bt_a2dp_task, "bt_a2dp", 3072, NULL, 1, NULL, 0) != pdPASS) {
         return NULL;
     }
 
-    if (xSemaphoreTake(s_init_sem, pdMS_TO_TICKS(10000)) != pdTRUE) {
-        vSemaphoreDelete(s_init_sem);
-        s_init_sem = NULL;
-        return NULL;
-    }
-
-    vSemaphoreDelete(s_init_sem);
-    s_init_sem = NULL;
     return &s_iface;
 }
 

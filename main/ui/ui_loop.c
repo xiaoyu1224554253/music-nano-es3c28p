@@ -11,9 +11,11 @@
 #include "audio_task.h"
 #include "sys_monitor.h"
 #include "app.h"
+#include "drv_display.h"
 #include "ui_core.h"
 #include "ui_player.h"
 #include "menu.h"
+#include "power_mgr.h"
 
 #define LVGL_TAG "LVGL"
 
@@ -32,7 +34,11 @@ void ui_loop_task(void *arg)
     xQueueAddToSet(g_ui_bt_iface->evt_queue, s_queue_set);
     xQueueAddToSet(g_ui_audio_rsp_queue, s_queue_set);
 
-    ESP_LOGI(LVGL_TAG, "UI ready");
+    /* LCD 后半段: 距 SLPOUT ≥120ms 后发寄存器命令 + DISPON (不足则阻塞补齐) */
+    lcd_init_finish();
+    lv_timer_handler();
+    power_mgr_init();   
+
 
     app_cmd_t   app_cmd;
     bt_evt_t    bt_evt;
@@ -151,6 +157,18 @@ void ui_loop_task(void *arg)
                     break;
                 case BT_EVT_STREAM_STOPPED:
                     printf("[stream stopped]\n");
+                    break;
+                case BT_EVT_PLAY_PAUSE:
+                    printf("[LVGL] BT 切换播放/暂停\n");
+                    player_toggle_play();
+                    break;
+                case BT_EVT_TRANSPORT_NEXT:
+                    printf("[LVGL] BT 下一曲\n");
+                    player_next();
+                    break;
+                case BT_EVT_TRANSPORT_PREV:
+                    printf("[LVGL] BT 上一曲\n");
+                    player_prev();
                     break;
                 case BT_EVT_STATE_RSP:
                     bt_list_on_state_rsp(bt_evt.state, bt_evt.device_name);

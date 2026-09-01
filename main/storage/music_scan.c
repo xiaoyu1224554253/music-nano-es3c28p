@@ -19,6 +19,8 @@
 #define PATH_BUF_SIZE     384
 #define SUBDIR_INIT       8
 
+volatile bool g_music_scan_force = false;
+
 static const char *MUSIC_EXTENSIONS[] = {
     ".mp3", ".flac", ".wav", ".aac",
     ".MP3", ".FLAC", ".WAV", ".AAC",
@@ -104,7 +106,7 @@ static void build_cache_path(const char *dir_path, char *out, size_t out_size)
         snprintf(out, out_size, "%s/sdcard_%s.txt", MUSIC_CACHE_DIR, rel);
         char *p = out + strlen(MUSIC_CACHE_DIR) + 1;
         while (*p) {
-            if (*p == '/') *p = '_';
+            if (*p == '/') *p = '%';
             p++;
         }
     }
@@ -276,6 +278,14 @@ void music_scan_init(void)
 
     ESP_LOGI(TAG_MUSIC_SCAN, "当前已用空间: %llu KB, 缓存记录: %llu KB",
              current_used, cached_used);
+
+    bool force = g_music_scan_force;
+    g_music_scan_force = false;
+    if (force) {
+        ESP_LOGI(TAG_MUSIC_SCAN, "手动触发重新扫描");
+        music_scan_run();
+        return;
+    }
 
     if (cached_used == 0) {
         ESP_LOGI(TAG_MUSIC_SCAN, "无缓存记录，开始全量扫描");

@@ -24,6 +24,17 @@ void    volume_inc(int32_t delta);
 void    volume_load_from_nvs(void);
 void    volume_save_to_nvs(void);
 
+/* ── 亮度 ── */
+#define BRIGHTNESS_MIN      1
+#define BRIGHTNESS_MAX      255
+#define BRIGHTNESS_DEFAULT  128
+
+uint8_t brightness_get(void);
+void    brightness_set(uint8_t v);
+
+void    brightness_load_from_nvs(void);
+void    brightness_save_to_nvs(void);
+
 /* ── 上次播放歌曲 ── */
 void last_song_save(const char *path);
 bool last_song_load(char *buf, size_t size);

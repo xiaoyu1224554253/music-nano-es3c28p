@@ -77,6 +77,8 @@ static bool open_decoder(const char *path)
     const char *dot = strrchr(path, '.');
     if (dot && strcasecmp(dot, ".flac") == 0) {
         s_decoder = decoder_flac_create();
+    } else if (dot && strcasecmp(dot, ".wav") == 0) {
+        s_decoder = decoder_wav_create();
     } else {
         s_decoder = decoder_mp3_create();
     }
@@ -99,6 +101,8 @@ static bool open_decoder(const char *path)
     if (cd && cs > 0) {
         cover_submit_job(cd, cs);
         s_decoder->take_cover(s_decoder);
+    } else {
+        cover_notify_no_cover();
     }
 
     printf("[音频] 解码器已加载: %s\n", path);
@@ -158,12 +162,14 @@ static void fill_song_info(void)
 
     g_song_info.sample_rate  = s_decoder->get_sample_rate(s_decoder);
     g_song_info.channels     = s_decoder->get_channels(s_decoder);
+    g_song_info.bits_per_sample = (s_decoder->get_bits ? s_decoder->get_bits(s_decoder) : 16);
     update_duration_elapsed();
 
     atomic_store_bool(&g_song_info_valid, true);
-    printf("[音频] 信息: %s | %s | %s | %" PRIu32 "Hz/%uch/%" PRIu32 "kbps | %" PRIu32 "s\n",
+    printf("[音频] 信息: %s | %s | %s | %" PRIu32 "Hz/%uch/%ubit/%" PRIu32 "kbps | %" PRIu32 "s\n",
            g_song_info.title, g_song_info.artist, g_song_info.format,
            g_song_info.sample_rate, g_song_info.channels,
+           g_song_info.bits_per_sample,
            g_song_info.bitrate_kbps, g_song_info.duration_sec);
 }
 
@@ -362,9 +368,9 @@ static void audio_task(void *arg)
                 }
             }
 
-            /* (4) 未填完 → 释放 CPU 10ms 回主循环(下轮只查命令+继续填, 不解码) */
+            /* (4) 未填完 → 释放 CPU 1ms 回主循环(缓冲满, 下轮只查命令+继续填, 不解码) */
             if (s_pcm_offset < s_out_bytes) {
-                vTaskDelay(pdMS_TO_TICKS(10));
+                vTaskDelay(pdMS_TO_TICKS(1));
                 break;
             }
 
