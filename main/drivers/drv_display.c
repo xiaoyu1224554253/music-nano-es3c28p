@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_log.h"
+#include "esp_check.h"
 #include "esp_timer.h"
 #include "esp_lcd_io_spi.h"
 #include "esp_lcd_panel_ops.h"
@@ -147,6 +148,18 @@ esp_lcd_panel_handle_t lcd_init_finish(void)
 esp_lcd_panel_handle_t lcd_get_panel(void)
 {
     return s_panel;
+}
+
+/* 同步刷屏: 先排入 DMA 后台传输, 再通过一次无命令 tx_param 等待在途 color 事务全部排空,
+ * 确保返回时 color_data 不再被 DMA 读取 (esp_lcd_panel_io_tx_color 为异步,
+ * 调用方须等 on_color_trans_done/tx_param 排空后才能复用或释放缓冲). */
+esp_err_t lcd_draw_bitmap_sync(int x_start, int y_start, int x_end, int y_end,
+                               const void *color_data)
+{
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(s_panel, x_start, y_start, x_end, y_end, color_data),
+                        TAG, "draw bitmap failed");
+    /* 无命令/无参数的 tx_param: 语义上是"等队列清空再执行", 充当 DMA 屏障 */
+    return esp_lcd_panel_io_tx_param(s_panel_io, -1, NULL, 0);
 }
 
 /* ────────────────────────── Backlight (LEDC PWM) ────────────────────────── */

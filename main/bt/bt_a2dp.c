@@ -699,6 +699,9 @@ static void bt_a2dp_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+    if (esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9) != ESP_OK) {
+        ESP_LOGW(BT_TAG, "设置蓝牙发射功率失败");
+    }
 
     /* 初始化并启用 Bluedroid 协议栈 */
     esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();

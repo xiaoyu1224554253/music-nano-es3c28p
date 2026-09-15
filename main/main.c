@@ -26,6 +26,11 @@ void app_main(void)
     power_mgr_early_init();
     lcd_init_early(SPI2_HOST);
 
+    /* 开机低电量检测: 初始化 ADC + 3 次采样平均 → g_vbat.
+     * 电压 < 3.35V 时: 显示低电量图 2 秒后进入深度睡眠 (此处不返回);
+     * 电压正常: 直接返回, 继续正常启动 (lcd_init_finish 在 LVGL 任务完成). */
+    power_mgr_boot_battery_check();
+
     nvs_flash_init();   /* 初始化非易失存储 (保存配对信息/亮度/音量等设置) */
 
     /* 创建三个系统队列 (容量 10/10/5, 元素为对应命令结构体) */

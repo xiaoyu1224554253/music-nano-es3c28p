@@ -20,6 +20,11 @@ esp_lcd_panel_handle_t lcd_init_finish(void);
 /* 面板句柄 (LVGL 注册显示驱动用, 早于 lcd_init_finish) */
 esp_lcd_panel_handle_t lcd_get_panel(void);
 
+/* 同步刷屏: 整窗写入 color_data 并等待 DMA 传输排空后才返回 (color_data 可安全复用/释放).
+ * 坐标同 esp_lcd_panel_draw_bitmap (x_end/y_end 为排他边界). */
+esp_err_t lcd_draw_bitmap_sync(int x_start, int y_start, int x_end, int y_end,
+                               const void *color_data);
+
 /* 背光亮度 (LEDC PWM, 0~255) */
 void lcd_set_brightness(uint8_t level);
 

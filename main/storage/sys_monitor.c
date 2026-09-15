@@ -5,9 +5,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
@@ -18,6 +15,7 @@
 #include <stdio.h>
 #include "esp_heap_caps.h"
 #include "atomic_utils.h"
+#include "power_mgr.h"
 #include "sys_monitor.h"
 
 /* 安全拷贝: 把 src 复制到 dst (目标大小 dst_sz), 保证结尾 '\0' */
@@ -33,7 +31,6 @@ static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
 
 #define TAG_SDMMC   "SDMMC"
 #define TAG_DETECT  "SD_DETECT"
-#define TAG_ADC     "SYS_MON"
 
 #define MOUNT_POINT  "/sdcard"       /* SD 卡挂载点 */
 #define PIN_SD_DETECT 13             /* SD 卡插入检测引脚 (高=未插入) */
@@ -42,16 +39,12 @@ static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
 #define PIN_CMD 15                   /* SDMMC 命令脚 */
 #define PIN_D0   2                   /* SDMMC 数据线 (1bit 模式只需 D0) */
 
-#define VBAT_ADC_UNIT   ADC_UNIT_1   /* 电池电压使用的 ADC 单元 */
-#define VBAT_ADC_CHAN   ADC_CHANNEL_7 /* 电池电压 ADC 通道 */
-
-#define VBAT_DIVIDER_RATIO 2.0f      /* 分压比: 电阻分压 2:1, 电压乘 2 还原 */
-
 #define SAMPLE_COUNT  10             /* 采样次数 (取平均滤波) */
 #define SAMPLE_DELAY_MS 10           /* 相邻两次采样间隔 */
 #define SENSOR_INTERVAL_TICKS 10     /* 传感器采样周期计数 (×100ms = 1s) */
 
 #define CPU_TEMP_OFFSET_C  20.0f     /* CPU 内部温度传感器校准偏移 */
+#define VBAT_CRITICAL_LOW_V  3.25f   /* 运行中临界电压 (低于此值直接深睡关机) */
 #define MUSIC_CACHE        "/sdcard/.music_cache"   /* 音乐缓存目录 */
 #define FS_CACHE_MAGIC     0x4D555349              /* 文件缓存魔数 "MUSI" */
 
@@ -61,9 +54,6 @@ volatile float g_vbat     = 0.0f;       /* 电池电压 (V) */
 volatile float g_cpu_temp = 0.0f;       /* CPU 温度 (C) */
 volatile bool  g_sd_manual_rescan = false;  /* 手动重扫标志 */
 fs_cache_t     *g_fs_cache     = NULL;      /* 文件缓存指针 (PSRAM) */
-
-static adc_oneshot_unit_handle_t s_adc_handle = NULL;   /* ADC 单元句柄 */
-static adc_cali_handle_t         s_cali_handle = NULL;  /* ADC 校准句柄 (eFuse 两点校准) */
 
 static sdmmc_card_t *s_card    = NULL;   /* SD 卡信息结构体 */
 static bool          s_mounted = false;  /* 是否已挂载 */
@@ -407,23 +397,8 @@ static float read_cpu_temp(void)
     return ((float)temprature_sens_read() - 32.0f) / 1.8f - CPU_TEMP_OFFSET_C;
 }
 
-/* 读取电池电压: ADC 原始值 → mV (优先 eFuse 校准, 否则线性估算) → V × 分压比 */
-static float read_vbat(void)
-{
-    int raw;
-    adc_oneshot_read(s_adc_handle, VBAT_ADC_CHAN, &raw);   /* 单次 ADC 采集 */
-
-    int mv = 0;
-    if (s_cali_handle != NULL) {
-        adc_cali_raw_to_voltage(s_cali_handle, raw, &mv);   /* 校准曲线换算 */
-    } else {
-        mv = raw * 3300 / 4095;   /* 兜底线性: 3.3V/12bit */
-    }
-
-    return (float)mv / 1000.0f * VBAT_DIVIDER_RATIO;   /* mV→V, 再乘分压比还原真实电压 */
-}
-
-/* 传感器采样: 多次取平均, 抑制 ADC 噪声 */
+/* 传感器采样: 多次取平均, 抑制 ADC 噪声.
+ * 电池电压 ADC 由 power_mgr 持有, 这里复用其读取接口 (确保周期采样仍更新 g_vbat) */
 static void sample_sensors(void)
 {
     float temp_sum = 0.0f;
@@ -433,7 +408,7 @@ static void sample_sensors(void)
         temp_sum += read_cpu_temp();
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
 
-        vbat_sum += read_vbat();
+        vbat_sum += power_mgr_vbat_read_once();
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_DELAY_MS));
     }
 
@@ -447,29 +422,6 @@ static void sample_sensors(void)
 static void sys_monitor_task(void *arg)
 {
     gpio_set_direction(PIN_SD_DETECT, GPIO_MODE_INPUT);   /* SD 检测脚设为输入 */
-
-    /* 配置 ADC 单元 (单次采集) */
-    adc_oneshot_unit_init_cfg_t unit_cfg = {
-        .unit_id = VBAT_ADC_UNIT,
-    };
-    adc_oneshot_new_unit(&unit_cfg, &s_adc_handle);
-
-    /* 配置通道: 12bit, 量程 0~3.3V */
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten    = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    adc_oneshot_config_channel(s_adc_handle, VBAT_ADC_CHAN, &chan_cfg);
-
-    /* 创建 eFuse 两点校准 (更精确), 失败则退回线性估算 */
-    adc_cali_line_fitting_config_t cali_cfg = {
-        .unit_id  = VBAT_ADC_UNIT,
-        .atten    = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    if (adc_cali_create_scheme_line_fitting(&cali_cfg, &s_cali_handle) != ESP_OK) {
-        ESP_LOGW(TAG_ADC, "eFuse 两点校准不可用, 退回线性估算");
-    }
 
     bool last = (gpio_get_level(PIN_SD_DETECT) == 1);   /* 初始检测电平 (true=未插入) */
     int  tick = SENSOR_INTERVAL_TICKS;                  /* 采样倒计时, 初始即采样 */
@@ -510,6 +462,11 @@ static void sys_monitor_task(void *arg)
         if (++tick >= SENSOR_INTERVAL_TICKS) {   /* 每 SENSOR_INTERVAL_TICKS 次循环采一次传感器 */
             tick = 0;
             sample_sensors();
+
+            /* 周期低压检测: 低于临界值 → 无动画直接深睡 (深度睡眠即重启系统, 无需善后) */
+            if (g_vbat < VBAT_CRITICAL_LOW_V) {
+                power_mgr_critical_shutdown();
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));   /* 轮询周期 100ms */
