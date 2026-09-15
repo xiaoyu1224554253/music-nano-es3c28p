@@ -26,9 +26,10 @@ extern const lv_font_t lv_font_global_16;
 #define PIN_VOL_UP     36
 #define PIN_VOL_DOWN   38
 #define PIN_PWR_KEY    37                /* 息屏/唤醒按键 (GPIO37, 外部10k下拉) */
-#define VOLUME_STEP    8
+#define VOLUME_STEP    4                  /* 单步步进 */
 #define VOL_KEY_POLL_MS 10                /* 轮询周期 10ms */
-#define VOL_KEY_MIN_MS 100                /* 两次触发最小间隔 */
+#define VOL_LONGPRESS_MS 600              /* 长按判定: 超过此值进入重复模式 */
+#define VOL_REPEAT_MS  150                /* 长按重复步进间隔 */
 
 /* 音量弹窗: (140,45) 30x110, 变化时滑入显示, 2秒无变化滑出隐藏 */
 #define VOL_POP_X       140
@@ -751,27 +752,50 @@ static void volume_monitor_cb(lv_timer_t *timer)
     volume_save_to_nvs();
 }
 
+/* 音量键状态: 上升沿单步 + 长按(>600ms)后每 150ms 重复 */
+typedef struct {
+    bool    prev;       /* 上次采样电平 (上升沿检测) */
+    bool    repeating;  /* 是否已进入长按重复模式 */
+    int64_t next_us;    /* 下次允许步进的时刻 (us) */
+} vol_key_state_t;
+static vol_key_state_t s_vol_up, s_vol_down;
+
+/* 单个音量键状态机: pin=引脚, dir=+1/-1, st=该键状态 */
+static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
+{
+    bool    level = (gpio_get_level(pin) == 1);   /* 高=按下 (外部下拉) */
+    int64_t now   = esp_timer_get_time();
+
+    if (level) {
+        if (!st->prev) {                          /* 上升沿: 立即 ±4 一次 */
+            volume_inc(dir * VOLUME_STEP);
+            st->repeating = false;
+            st->next_us   = now + VOL_LONGPRESS_MS * 1000LL;
+        } else if (!st->repeating) {
+            if (now >= st->next_us) {             /* 按住超过 600ms: 进入长按, 补一步 */
+                st->repeating = true;
+                volume_inc(dir * VOLUME_STEP);
+                st->next_us = now + VOL_REPEAT_MS * 1000LL;
+            }
+        } else if (now >= st->next_us) {          /* 长按中: 每 150ms ±4 */
+            volume_inc(dir * VOLUME_STEP);
+            st->next_us = now + VOL_REPEAT_MS * 1000LL;
+        }
+    } else {
+        st->repeating = false;                    /* 松开: 退出重复 */
+    }
+    st->prev = level;
+}
+
 /* 按键轮询 (10ms): 息屏/唤醒键(上升沿) + 音量键增减.
  * 之前放在 sys_monitor(10Hz) 会漏掉 <100ms 的短按, 移入 LVGL 用 10ms 轮询.
- * 息屏键采样放最前(不受音量 100ms 节流影响), 由 power_mgr 做上升沿检测 */
+ * 息屏键采样放最前(不受音量节流影响), 由 power_mgr 做上升沿检测 */
 static void btn_key_poll_cb(lv_timer_t *timer)
 {
     power_mgr_poll_key(gpio_get_level(PIN_PWR_KEY) == 1);
 
-    static int64_t s_vol_key_last_us = 0;
-
-    int64_t now = esp_timer_get_time();
-    if ((now - s_vol_key_last_us) < VOL_KEY_MIN_MS * 1000LL) {
-        return;   /* 防连发 */
-    }
-
-    if (gpio_get_level(PIN_VOL_UP) == 1) {
-        volume_inc(VOLUME_STEP);
-        s_vol_key_last_us = now;
-    } else if (gpio_get_level(PIN_VOL_DOWN) == 1) {
-        volume_inc(-VOLUME_STEP);
-        s_vol_key_last_us = now;
-    }
+    vol_key_poll_one(PIN_VOL_UP,   +1, &s_vol_up);
+    vol_key_poll_one(PIN_VOL_DOWN, -1, &s_vol_down);
 }
 
 /* 初始化音量按键: 配输入引脚 + 创建 10ms 轮询定时器 */

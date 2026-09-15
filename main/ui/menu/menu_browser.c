@@ -27,7 +27,7 @@ static lv_obj_t  *s_fs_next_btn  = NULL;  /* 下一页按钮 */
 static int   s_fs_page            = 0;     /* 当前页 */
 static int   s_fs_total           = 0;     /* 总页数 */
 static bool  s_fs_inside          = false; /* 是否已进入子目录 */
-static const char *s_fs_group    = NULL;   /* 当前分组 (sdcard 或 sdcard_xxx) */
+static const char *s_fs_group    = NULL;   /* 当前分组 (sdcard / sdcard%a%b) */
 static lv_obj_t *s_fs_current_btn = NULL; /* 当前播放歌曲对应的列表行按钮 */
 
 static lv_img_dsc_t s_fs_icon_dir;    /* 文件夹图标 */
@@ -38,9 +38,40 @@ static void (*s_play_cb)(const char *group, const char *name) = NULL;   /* 点�
 static void fs_browser_open(void);
 static void fs_browser_close(void);
 static void fs_browser_show_page(int page);
-static void fs_browser_enter_dir(const char *cache_name);
+static void fs_browser_enter_dir(const char *parent_group, const char *name);
 static void fs_browser_go_back(void);
 static void fs_browser_jump_to_current(void);
+
+/* 当前分组缓冲: s_fs_group 始终指向它, 便于拼接/回退 */
+static char s_group_buf[FS_GROUP_MAX];
+
+/* 设置当前分组 (拷贝进 s_group_buf); g=NULL 表示无分组 */
+static void fs_set_group(const char *g)
+{
+    if (!g) {
+        s_fs_group = NULL;
+        return;
+    }
+    size_t n = strnlen(g, sizeof(s_group_buf) - 1);
+    memcpy(s_group_buf, g, n);
+    s_group_buf[n] = '\0';
+    s_fs_group = s_group_buf;
+}
+
+/* 由父 group + 子目录名拼出子 group: parent%name */
+static void fs_child_group(const char *parent, const char *name,
+                           char *out, size_t out_size)
+{
+    snprintf(out, out_size, "%s%%%s", parent, name);
+}
+
+/* group 的显示名 (最后一段); 根或无返回 "Music Files" */
+static const char *fs_group_display_name(const char *group)
+{
+    if (!group) return "Music Files";
+    const char *last = strrchr(group, '%');
+    return last ? last + 1 : "Music Files";
+}
 
 /* 注册点击播放回调: cb=播放函数 */
 void fs_list_set_play_cb(void (*cb)(const char *group, const char *name))
@@ -81,7 +112,7 @@ static void fs_item_click_cb(lv_event_t *e)
     if (!entry) return;
 
     if (entry->is_dir) {
-        fs_browser_enter_dir(entry->name);   /* 进入子目录 */
+        fs_browser_enter_dir(entry->group, entry->name);   /* 进入子目录 */
     } else if (s_play_cb) {
         /* 播放切换后由 fs_browser_refresh() 统一重绘, 让绿色高亮跟随新播放的歌曲 */
         s_play_cb(s_fs_group, entry->name);
@@ -93,24 +124,19 @@ static bool fs_entry_is_current(fs_entry_t *entry)
 {
     const char *group = player_current_group();
     const char *name  = player_current_name();
-    if (!group || !name || !entry) return false;
+    if (!group || !name || !entry || !s_fs_group) return false;
 
     /* 文件条目: 组与文件名都匹配 */
-    if (!entry->is_dir && s_fs_group
-        && strcmp(s_fs_group, group) == 0
-        && strcmp(entry->name, name) == 0) {
-        return true;
+    if (!entry->is_dir) {
+        return strcmp(s_fs_group, group) == 0 && strcmp(entry->name, name) == 0;
     }
 
-    /* 根目录下: 高亮包含当前播放歌曲的文件夹 */
-    if (entry->is_dir && s_fs_group
-        && strcmp(s_fs_group, "sdcard") == 0
-        && strncmp(group, "sdcard_", 7) == 0
-        && strcmp(entry->name, group + 7) == 0) {
-        return true;
-    }
-
-    return false;
+    /* 目录条目: 当前播放歌曲所在目录是其子孙 → 高亮该文件夹 */
+    char child[FS_GROUP_MAX];
+    fs_child_group(entry->group, entry->name, child, sizeof(child));
+    size_t cl = strlen(child);
+    return strncmp(group, child, cl) == 0
+           && (group[cl] == '\0' || group[cl] == '%');
 }
 
 /* 向列表添加一个条目 (带图标), 若为当前播放歌曲则绿色高亮 */
@@ -172,7 +198,7 @@ static void fs_browser_show_page(int page)
     lv_obj_clean(s_fs_list);   /* 清空重建 */
 
     if (total == 0) {   /* 空目录提示 */
-        lv_obj_t *btn = lv_list_add_btn(s_fs_list, NULL, "无文件");
+        lv_obj_t *btn = lv_list_add_btn(s_fs_list, NULL, "无音乐文件");
         lv_obj_set_height(btn, 30);
         lv_obj_set_style_pad_all(btn, 0, 0);
         lv_obj_set_style_pad_top(btn, 3, 0);
@@ -236,26 +262,40 @@ static void fs_overlay_click_cb(lv_event_t *e)
         panel_anim_close(&cfg);
 }
 
-static void fs_browser_enter_dir(const char *cache_name)
+static void fs_browser_enter_dir(const char *parent_group, const char *name)
 {
     s_fs_inside = true;
 
-    static char group_buf[FS_GROUP_MAX];
-    snprintf(group_buf, sizeof(group_buf), "sdcard_%s", cache_name);   /* 组名 = sdcard_子目录 */
-    s_fs_group = group_buf;
+    char child[FS_GROUP_MAX];
+    fs_child_group(parent_group, name, child, sizeof(child));   /* 组名 = 父%子 */
+    fs_set_group(child);
 
-    lv_label_set_text(s_fs_title, cache_name);   /* 标题 = 目录名 */
+    lv_label_set_text(s_fs_title, name);   /* 标题 = 目录名 */
 
     fs_browser_show_page(0);
 }
 
-/* 返回根目录 */
+/* 返回上一级目录 (根则不变) */
 static void fs_browser_go_back(void)
 {
-    s_fs_inside = false;
-    s_fs_group  = "sdcard";
+    if (!s_fs_group) return;
 
-    lv_label_set_text(s_fs_title, "Music Files");
+    /* 截到最后一个 '%' 得到父 group */
+    char parent[FS_GROUP_MAX];
+    size_t n = strnlen(s_fs_group, sizeof(parent) - 1);
+    memcpy(parent, s_fs_group, n);
+    parent[n] = '\0';
+
+    char *last = strrchr(parent, '%');
+    if (last) {
+        *last = '\0';
+        fs_set_group(parent);
+    } else {
+        fs_set_group("sdcard");   /* 已在根 */
+    }
+
+    s_fs_inside = (strcmp(s_fs_group, "sdcard") != 0);
+    lv_label_set_text(s_fs_title, fs_group_display_name(s_fs_group));
     fs_browser_show_page(0);
 }
 
@@ -385,7 +425,7 @@ static void fs_browser_open(void)
     lv_obj_set_style_text_color(next_lbl, lv_color_hex(0x0000FF), 0);
     lv_obj_center(next_lbl);
 
-    s_fs_group = "sdcard";   /* 默认根目录 */
+    fs_set_group("sdcard");   /* 默认根目录 */
     fs_browser_show_page(0);
 
     /* 打开后自动定位到主界面当前播放的歌曲 */
@@ -402,14 +442,9 @@ static void fs_browser_jump_to_current(void)
     if (!group || !name || !g_fs_cache) return;
 
     /* 切换到当前播放歌曲所在的组 (目录) */
-    if (strncmp(group, "sdcard_", 7) == 0) {
-        s_fs_inside = true;
-        lv_label_set_text(s_fs_title, group + 7);
-    } else {
-        s_fs_inside = false;
-        lv_label_set_text(s_fs_title, "Music Files");
-    }
-    s_fs_group = group;
+    fs_set_group(group);
+    s_fs_inside = (strcmp(group, "sdcard") != 0);
+    lv_label_set_text(s_fs_title, fs_group_display_name(group));
 
     /* 在组内 (含目录项, 与列表显示顺序一致) 找到该文件的位置 */
     int pos = -1;
@@ -441,7 +476,7 @@ static void fs_browser_jump_to_current(void)
 }
 
 /* 两向同步: 播放歌曲变化时刷新绿色高亮。
- * 仅当浏览器打开且当前歌曲在当前视图内 (本组 / 根目录高亮文件夹) 时重绘, 保留滚动位置。 */
+ * 仅当浏览器打开且当前分组是播放歌曲所在目录的祖先 (或相等) 时重绘, 保留滚动位置。 */
 void fs_browser_refresh(void)
 {
     if (!s_fs_overlay || !g_fs_cache || !s_fs_group) return;
@@ -450,9 +485,9 @@ void fs_browser_refresh(void)
     const char *name  = player_current_name();
     if (!group || !name) return;
 
+    size_t sl = strlen(s_fs_group);
     bool in_view = (strcmp(s_fs_group, group) == 0)
-                   || (strcmp(s_fs_group, "sdcard") == 0
-                       && strncmp(group, "sdcard_", 7) == 0);
+                   || (strncmp(group, s_fs_group, sl) == 0 && group[sl] == '%');
     if (!in_view) return;
 
     lv_coord_t scroll_y = lv_obj_get_scroll_y(s_fs_list);
@@ -490,7 +525,7 @@ void fs_menu_click_cb(lv_event_t *e)
 void fs_browser_on_sd_ready(void)
 {
     if (s_fs_overlay) {
-        s_fs_group = "sdcard";
+        fs_set_group("sdcard");
         s_fs_inside = false;
         lv_label_set_text(s_fs_title, "Music Files");
         fs_browser_show_page(0);
@@ -500,7 +535,7 @@ void fs_browser_on_sd_ready(void)
 void fs_browser_on_sd_remove(void)
 {
     if (s_fs_overlay) {
-        s_fs_group = NULL;
+        fs_set_group(NULL);
         fs_browser_show_page(0);
     }
 }
