@@ -1,28 +1,27 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "board_config.h"
+#include "board_i2c.h"
 #include "touch.h"
 
 #define TAG "touch"
 
-/* 触摸芯片 (FT6336G) I2C 配置 */
-#define TOUCH_I2C_PORT      BOARD_TOUCH_I2C_PORT
-#define TOUCH_SCL_IO        BOARD_TOUCH_SCL
-#define TOUCH_SDA_IO        BOARD_TOUCH_SDA
+/* 触摸芯片 (FT6336G): 与音频 codec 共用板载 I2C 总线 */
 #define TOUCH_ADDR          BOARD_TOUCH_ADDR
 #define TOUCH_RST_IO        BOARD_TOUCH_RST
 #define TOUCH_INT_IO        BOARD_TOUCH_INT
 
 #define TOUCH_CMD_TIMEOUT_MS 5          /* 短超时: 事务卡住也快速返回, 不拖累 LVGL */
 
-static volatile bool s_int_flag = false;   /* INT 下降沿标志 (ISR 置位, 任务清) */
-static bool          s_present  = false;   /* 当前是否有有效触点 (仅任务写) */
-static int32_t       s_x        = 0;       /* 最近一次原始 X 坐标 */
-static int32_t       s_y        = 0;       /* 最近一次原始 Y 坐标 */
+static i2c_master_dev_handle_t s_dev = NULL;   /* FT6336 I2C 设备句柄 */
+static volatile bool s_int_flag = false;       /* INT 下降沿标志 (ISR 置位, 任务清) */
+static bool          s_present  = false;       /* 当前是否有有效触点 (仅任务写) */
+static int32_t       s_x        = 0;           /* 最近一次原始 X 坐标 */
+static int32_t       s_y        = 0;           /* 最近一次原始 Y 坐标 */
 
 /* GPIO INT ISR: 只锁存标志 */
 static void IRAM_ATTR touch_int_isr(void *arg)
@@ -38,8 +37,9 @@ static bool touch_read_raw(int32_t *x, int32_t *y)
     uint8_t reg = 0x02;
     uint8_t buf[5] = {0};
 
-    esp_err_t ret = i2c_master_write_read_device(TOUCH_I2C_PORT, TOUCH_ADDR,
-        &reg, 1, buf, sizeof(buf), pdMS_TO_TICKS(TOUCH_CMD_TIMEOUT_MS));
+    if (s_dev == NULL) return false;
+    esp_err_t ret = i2c_master_transmit_receive(s_dev, &reg, 1, buf, sizeof(buf),
+                                                pdMS_TO_TICKS(TOUCH_CMD_TIMEOUT_MS));
     if (ret != ESP_OK) return false;
 
     if ((buf[0] & 0x0F) == 0) return false;   /* 无触点 */
@@ -47,21 +47,6 @@ static bool touch_read_raw(int32_t *x, int32_t *y)
     *x = ((buf[1] & 0x0F) << 8) | buf[2];
     *y = ((buf[3] & 0x0F) << 8) | buf[4];
     return true;
-}
-
-/* I2C 总线初始化: 400kHz 主模式, 使能内部上拉 */
-static void touch_bus_init(void)
-{
-    i2c_config_t conf = {
-        .mode          = I2C_MODE_MASTER,
-        .sda_io_num    = TOUCH_SDA_IO,
-        .scl_io_num    = TOUCH_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,
-    };
-    ESP_ERROR_CHECK(i2c_param_config(TOUCH_I2C_PORT, &conf));
-    ESP_ERROR_CHECK(i2c_driver_install(TOUCH_I2C_PORT, conf.mode, 0, 0, 0));
 }
 
 /* 硬件复位 FT6336 (低有效脉冲) */
@@ -81,11 +66,17 @@ static void touch_hw_reset(void)
     vTaskDelay(pdMS_TO_TICKS(120));   /* 复位后需稳定时间 */
 }
 
-/* 初始化: 硬件复位 + I2C 总线 + INT 输入/上拉/下降沿中断 */
+/* 初始化: 硬件复位 + 挂到共享 I2C 总线 + INT 下降沿中断 */
 void touch_init(void)
 {
     touch_hw_reset();
-    touch_bus_init();
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = TOUCH_ADDR,
+        .scl_speed_hz    = 400000,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(board_i2c_bus(), &dev_cfg, &s_dev));
 
     gpio_config_t io = {
         .pin_bit_mask = 1ULL << TOUCH_INT_IO,
@@ -104,8 +95,8 @@ void touch_init(void)
 
     s_int_flag = false;
     s_present  = false;
-    ESP_LOGI(TAG, "触摸就绪 FT6336 (SDA=%d SCL=%d INT=%d RST=%d)",
-             TOUCH_SDA_IO, TOUCH_SCL_IO, TOUCH_INT_IO, TOUCH_RST_IO);
+    ESP_LOGI(TAG, "触摸就绪 FT6336 (addr=0x%02X INT=%d RST=%d)",
+             TOUCH_ADDR, TOUCH_INT_IO, TOUCH_RST_IO);
 }
 
 /* 读触点: 有中断或当前判定按下时才读 I2C */
