@@ -21,7 +21,9 @@ idf_component_register(SRCS "main.c"
                             "ui/menu/menu_bt.c"
                             "drivers/drv_display.c"
                             "drivers/touch.c"
+                            "board_i2c.c"
+                            "audio/audio_out.c"
                             "resources/icon_file.c"
                             "resources/lv_font_global_16.c"
-                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_ili9341 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec
+                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_ili9341 esp_lcd driver esp_driver_i2s micro-mp3 micro-flac esp_adc esp_psram jpegdec esp_codec_dev
                     INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources" "power")
