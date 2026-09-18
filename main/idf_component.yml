@@ -22,6 +22,8 @@ dependencies:
   #   public: true
   lvgl/lvgl: ==8.3.11
   espressif/esp_lcd_ili9341: ==1.2.0
+  # 本地音频输出: I2S → ES8311 codec
+  espressif/esp_codec_dev: ~1.5.6
   esphome/micro-mp3: ==0.4.0
   # 本地覆盖: 修复 JPEGDEC 对"三分量 1x2 采样"封面的支持 (managed_components 会被清空, 故放本地)
   bitbank2/jpegdec:
