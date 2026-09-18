@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "lvgl.h"
+#include "ui_core.h"
 #include "bt_a2dp.h"
 
 #ifdef __cplusplus

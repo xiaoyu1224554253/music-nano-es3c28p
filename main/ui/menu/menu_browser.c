@@ -325,7 +325,7 @@ static void fs_browser_open(void)
 
     /* 全屏透明遮罩 */
     s_fs_overlay = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(s_fs_overlay, 172, 320);
+    lv_obj_set_size(s_fs_overlay, TFT_HOR_RES, TFT_VER_RES);
     lv_obj_set_pos(s_fs_overlay, 0, 0);
     lv_obj_set_style_bg_opa(s_fs_overlay, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_fs_overlay, 0, 0);

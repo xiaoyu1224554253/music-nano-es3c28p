@@ -19,13 +19,14 @@
 #include "ui_player.h"
 #include "menu.h"
 #include "power_mgr.h"
+#include "board_config.h"
 
 extern const lv_font_t lv_font_global_16;
 
-/* 音量按键: 高电平(外部下拉)即增减, 由 LVGL 独立定时器(10ms)轮询 */
-#define PIN_VOL_UP     36
-#define PIN_VOL_DOWN   38
-#define PIN_PWR_KEY    37                /* 息屏/唤醒按键 (GPIO37, 外部10k下拉) */
+/* ES3C28P 只有 BOOT 一个物理键: 音量改用 UI 滑块控制, 音量键置为未连接 */
+#define PIN_VOL_UP     (-1)
+#define PIN_VOL_DOWN   (-1)
+#define PIN_PWR_KEY    BOARD_KEY_PWR     /* 息屏/唤醒键 = BOOT (GPIO0), 按下为低电平 */
 #define VOLUME_STEP    4                  /* 单步步进 */
 #define VOL_KEY_POLL_MS 10                /* 轮询周期 10ms */
 #define VOL_LONGPRESS_MS 600              /* 长按判定: 超过此值进入重复模式 */
@@ -763,6 +764,7 @@ static vol_key_state_t s_vol_up, s_vol_down;
 /* 单个音量键状态机: pin=引脚, dir=+1/-1, st=该键状态 */
 static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
 {
+    if (pin < 0) return;                          /* 未连接音量键: 直接跳过 */
     bool    level = (gpio_get_level(pin) == 1);   /* 高=按下 (外部下拉) */
     int64_t now   = esp_timer_get_time();
 
@@ -792,17 +794,17 @@ static void vol_key_poll_one(int pin, int dir, vol_key_state_t *st)
  * 息屏键采样放最前(不受音量节流影响), 由 power_mgr 做上升沿检测 */
 static void btn_key_poll_cb(lv_timer_t *timer)
 {
-    power_mgr_poll_key(gpio_get_level(PIN_PWR_KEY) == 1);
+    (void)timer;
+    /* BOOT 键按下为低电平, 取反后交给电源管理做"变为按下"的沿检测 */
+    power_mgr_poll_key(gpio_get_level(PIN_PWR_KEY) == 0);
 
     vol_key_poll_one(PIN_VOL_UP,   +1, &s_vol_up);
     vol_key_poll_one(PIN_VOL_DOWN, -1, &s_vol_down);
 }
 
-/* 初始化音量按键: 配输入引脚 + 创建 10ms 轮询定时器 */
+/* 初始化按键: 本板无音量键, 仅创建 10ms 轮询定时器 (BOOT 键由 power_mgr 配置) */
 static void vol_key_init(void)
 {
-    gpio_set_direction(PIN_VOL_UP, GPIO_MODE_INPUT);
-    gpio_set_direction(PIN_VOL_DOWN, GPIO_MODE_INPUT);
     lv_timer_create(btn_key_poll_cb, VOL_KEY_POLL_MS, NULL);
 }
 

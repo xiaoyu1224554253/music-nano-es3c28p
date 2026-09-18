@@ -23,5 +23,5 @@ idf_component_register(SRCS "main.c"
                             "drivers/touch.c"
                             "resources/icon_file.c"
                             "resources/lv_font_global_16.c"
-                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_jd9853 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec
+                    PRIV_REQUIRES bt nvs_flash fatfs esp_lcd_ili9341 esp_lcd driver micro-mp3 micro-flac esp_adc esp_psram jpegdec
                     INCLUDE_DIRS "." "app" "audio" "bt" "storage" "ui" "ui/menu" "drivers" "resources" "power")

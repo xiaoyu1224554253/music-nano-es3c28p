@@ -9,16 +9,18 @@
 #include "drv_display.h"
 #include "touch.h"
 #include "ui_core.h"
+#include "board_config.h"
 #include "settings.h"
 
 #define TAG "ui_core"
 
-#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 10 * 7)   /* 绘制缓冲总大小 (屏的 70%) */
-#define LVGL_BUF_SIZE  (DRAW_BUF_SIZE / 2)                    /* 单帧缓冲 = 一半 */
+/* 绘制缓冲: 屏的 1/8 (320x240 → 每缓冲 4800 像素 ≈ 9.4KB, 双缓冲) */
+#define DRAW_BUF_SIZE  (TFT_HOR_RES * TFT_VER_RES / 8)
+#define LVGL_BUF_SIZE  (DRAW_BUF_SIZE / 2)
 
-/* 触摸原始坐标的可用范围 (用于线性映射到屏幕坐标) */
-#define TOUCH_Y_MIN  5
-#define TOUCH_Y_MAX  310
+/* 触摸原始坐标范围 (FT6336 与屏原生一致: 240x320) */
+#define TOUCH_RAW_W   240
+#define TOUCH_RAW_H   320
 
 /* UI 共享句柄 */
 QueueHandle_t        g_ui_app_cmd_queue  = NULL;   /* 应用命令队列 */
@@ -61,16 +63,25 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 
     int32_t tx, ty;
     if (touch_poll(&tx, &ty)) {
-        /* 原始 Y 映射到屏幕坐标 */
-        ty = (int32_t)(((int)ty - TOUCH_Y_MIN) * (TFT_VER_RES - 1)
-                       / (TOUCH_Y_MAX - TOUCH_Y_MIN));
-        /* 屏幕安装方向: 水平/垂直都翻转 */
-        tx = TFT_HOR_RES - 1 - tx;
-        ty = TFT_VER_RES - 1 - ty;
-        if (tx >= TFT_HOR_RES) tx = TFT_HOR_RES - 1;   /* 钳制 */
-        if (ty >= TFT_VER_RES) ty = TFT_VER_RES - 1;
-        data->point.x = (lv_coord_t)tx;
-        data->point.y = (lv_coord_t)ty;
+        /* FT6336 输出与屏原生方向一致 (240x320).
+         * 面板已 SWAP_XY → 显示 320x240, 故屏幕 X 取触摸 Y, 屏幕 Y 取触摸 X. */
+        int32_t sx, sy;
+#if BOARD_LCD_SWAP_XY
+        sx = ty;
+        sy = tx;
+#else
+        sx = tx;
+        sy = ty;
+#endif
+        if (BOARD_LCD_MIRROR_X) sx = (TOUCH_RAW_H - 1) - sx;
+        if (BOARD_LCD_MIRROR_Y) sy = (TOUCH_RAW_W - 1) - sy;
+
+        if (sx >= TFT_HOR_RES) sx = TFT_HOR_RES - 1;   /* 钳制 */
+        if (sy >= TFT_VER_RES) sy = TFT_VER_RES - 1;
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        data->point.x = (lv_coord_t)sx;
+        data->point.y = (lv_coord_t)sy;
         data->state = LV_INDEV_STATE_PR;   /* 按下 */
     } else {
         data->state = LV_INDEV_STATE_REL;   /* 抬起 */

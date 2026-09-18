@@ -11,6 +11,7 @@
 #include "bt_a2dp.h"
 #include "sys_monitor.h"
 #include "cover.h"
+#include "board_config.h"
 
 /* 系统级消息队列句柄 (跨模块共享) */
 static QueueHandle_t s_app_cmd_queue  = NULL;   /* 应用命令队列: console→app 层(扫描/连接/播放等) */
@@ -24,7 +25,7 @@ void app_main(void)
     /* 最先: 开外设供电 + LCD 前半段 (SPI/面板/SLPOUT, 非阻塞), 让 120ms 在启动期间流逝.
      * 这样把 LCD 上电时序 "藏" 进后续初始化时间里, 减少用户可见的启动延迟. */
     power_mgr_early_init();
-    lcd_init_early(SPI2_HOST);
+    lcd_init_early(BOARD_LCD_HOST);
 
     /* 开机低电量检测: 初始化 ADC + 3 次采样平均 → g_vbat.
      * 电压 < 3.35V 时: 显示低电量图 2 秒后进入深度睡眠 (此处不返回);

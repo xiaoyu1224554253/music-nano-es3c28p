@@ -177,7 +177,7 @@ static void bt_list_open(void)
 
     /* 全屏透明遮罩按钮 */
     s_bt_overlay = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(s_bt_overlay, 172, 320);
+    lv_obj_set_size(s_bt_overlay, TFT_HOR_RES, TFT_VER_RES);
     lv_obj_set_pos(s_bt_overlay, 0, 0);
     lv_obj_set_style_bg_opa(s_bt_overlay, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_bt_overlay, 0, 0);

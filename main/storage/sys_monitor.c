@@ -29,15 +29,23 @@ static inline void buf_copy(char *dst, size_t dst_sz, const char *src)
     dst[n] = '\0';
 }
 
+#include "board_config.h"
+
 #define TAG_SDMMC   "SDMMC"
 #define TAG_DETECT  "SD_DETECT"
 
 #define MOUNT_POINT  "/sdcard"       /* SD 卡挂载点 */
-#define PIN_SD_DETECT 13             /* SD 卡插入检测引脚 (高=未插入) */
+#define PIN_SD_DETECT (-1)           /* 本板无卡检测脚: 上电直接挂载, 靠手动重扫 */
 
-#define PIN_CLK 14                   /* SDMMC 时钟脚 */
-#define PIN_CMD 15                   /* SDMMC 命令脚 */
-#define PIN_D0   2                   /* SDMMC 数据线 (1bit 模式只需 D0) */
+#define PIN_CLK BOARD_SD_CLK         /* SDMMC 时钟脚 */
+#define PIN_CMD BOARD_SD_CMD         /* SDMMC 命令脚 */
+#define PIN_D0  BOARD_SD_D0          /* SDMMC 数据线 D0 */
+#define PIN_D1  BOARD_SD_D1
+#define PIN_D2  BOARD_SD_D2
+#define PIN_D3  BOARD_SD_D3
+
+/* 卡检测脚可用性 (-1 = 无检测脚, 始终认为卡在位) */
+#define SD_DETECT_USED  (PIN_SD_DETECT >= 0)
 
 #define SAMPLE_COUNT  10             /* 采样次数 (取平均滤波) */
 #define SAMPLE_DELAY_MS 10           /* 相邻两次采样间隔 */
@@ -370,13 +378,16 @@ void sdmmc_disk_init(void)
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.width = 1;                                /* 1bit 模式 */
+    slot_config.width = 4;                                /* 4bit 模式 (本板 SDIO 4 线) */
     slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP; /* 使用内部上拉 */
 
-#ifdef CONFIG_SOC_SDMMC_USE_GPIO_MATRIX   /* 某些芯片 SDMMC 引脚可映射, 指定自定义引脚 */
+#ifdef CONFIG_SOC_SDMMC_USE_GPIO_MATRIX   /* 通过 GPIO 矩阵指定自定义引脚 */
     slot_config.clk = PIN_CLK;
     slot_config.cmd = PIN_CMD;
     slot_config.d0  = PIN_D0;
+    slot_config.d1  = PIN_D1;
+    slot_config.d2  = PIN_D2;
+    slot_config.d3  = PIN_D3;
 #endif
 
     esp_err_t ret = esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot_config,
@@ -439,6 +450,7 @@ void sdmmc_disk_set_event_callback(sd_event_cb_t cb, void *user_data)
     s_event_ctx = user_data;
 }
 
+#if CONFIG_IDF_TARGET_ESP32
 extern uint8_t temprature_sens_read(void);
 
 /* 读取 CPU 内部温度 (华氏原始值 → 摄氏, 再减校准偏移) */
@@ -446,6 +458,13 @@ static float read_cpu_temp(void)
 {
     return ((float)temprature_sens_read() - 32.0f) / 1.8f - CPU_TEMP_OFFSET_C;
 }
+#else
+/* ESP32-S3 没有该 ROM 接口, 换用 temperature_sensor 驱动成本较大, 先返回 0 (UI 显示 --) */
+static float read_cpu_temp(void)
+{
+    return 0.0f;
+}
+#endif
 
 /* 传感器采样: 多次取平均, 抑制 ADC 噪声.
  * 电池电压 ADC 由 power_mgr 持有, 这里复用其读取接口 (确保周期采样仍更新 g_vbat) */
@@ -471,9 +490,10 @@ static void sample_sensors(void)
 
 static void sys_monitor_task(void *arg)
 {
-    gpio_set_direction(PIN_SD_DETECT, GPIO_MODE_INPUT);   /* SD 检测脚设为输入 */
+    if (SD_DETECT_USED) gpio_set_direction(PIN_SD_DETECT, GPIO_MODE_INPUT);
 
-    bool last = (gpio_get_level(PIN_SD_DETECT) == 1);   /* 初始检测电平 (true=未插入) */
+    /* 无检测脚时恒为 false(已插入), 上电直接挂载 */
+    bool last = SD_DETECT_USED ? (gpio_get_level(PIN_SD_DETECT) == 1) : false;
     int  tick = SENSOR_INTERVAL_TICKS;                  /* 采样倒计时, 初始即采样 */
 
     ESP_LOGI(TAG_DETECT, "启动, GPIO%d 初始=%s", PIN_SD_DETECT, last ? "未插入" : "已插入");
@@ -483,7 +503,7 @@ static void sys_monitor_task(void *arg)
     }
 
     while (1) {
-        bool current = (gpio_get_level(PIN_SD_DETECT) == 1);   /* 当前电平 */
+        bool current = SD_DETECT_USED ? (gpio_get_level(PIN_SD_DETECT) == 1) : false;
 
         /* 手动重扫: 模拟拔卡→插卡流程 */
         if (g_sd_manual_rescan) {
@@ -493,7 +513,7 @@ static void sys_monitor_task(void *arg)
             sdmmc_disk_deinit();
             vTaskDelay(pdMS_TO_TICKS(500));
             sdmmc_disk_init();
-            last = (gpio_get_level(PIN_SD_DETECT) == 1);
+            last = SD_DETECT_USED ? (gpio_get_level(PIN_SD_DETECT) == 1) : false;
         }
 
         if (last && !current) {   /* 高→低: 插入 */

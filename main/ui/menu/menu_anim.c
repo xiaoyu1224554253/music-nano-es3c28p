@@ -62,7 +62,7 @@ static void fs_anim_compose(int w, int h)
 
     for (int y = 0; y < pth; y++) {
         uint8_t *dst = s_anim_buf_anim + y * ptw * 2;
-        uint8_t *bg  = s_anim_buf_main + ((s_anim_cfg->y + y) * 172 + s_anim_cfg->x) * 2;
+        uint8_t *bg  = s_anim_buf_main + ((s_anim_cfg->y + y) * TFT_HOR_RES + s_anim_cfg->x) * 2;
 
         /* y >= h: 容器未覆盖, 整行背景 */
         if (y >= h) {
@@ -444,11 +444,11 @@ void panel_anim_open(const panel_anim_cfg_t *cfg)
     int pw = cfg->w, ph = cfg->h;
 
     /* 1. 主界面截图 (面板未创建, 画面干净) */
-    s_anim_buf_main = fs_anim_alloc(172 * 320 * 2);
+    s_anim_buf_main = fs_anim_alloc(TFT_HOR_RES * TFT_VER_RES * 2);
     if (!s_anim_buf_main) { cfg->open_real(); return; }
     if (lv_snapshot_take_to_buf(lv_scr_act(), LV_IMG_CF_TRUE_COLOR,
                                 &s_anim_dsc_main, s_anim_buf_main,
-                                172 * 320 * 2) != LV_RES_OK) {
+                                TFT_HOR_RES * TFT_VER_RES * 2) != LV_RES_OK) {
         heap_caps_free(s_anim_buf_main); s_anim_buf_main = NULL;
         cfg->open_real();
         return;
@@ -510,7 +510,7 @@ void panel_anim_close(const panel_anim_cfg_t *cfg)
     /* 1. 当前面板截图 (可能已翻页/进目录) */
     s_anim_buf_fs = fs_anim_alloc(pw * ph * 2);
     s_anim_buf_anim = fs_anim_alloc(pw * ph * 2);
-    s_anim_buf_main = fs_anim_alloc(172 * 320 * 2);
+    s_anim_buf_main = fs_anim_alloc(TFT_HOR_RES * TFT_VER_RES * 2);
     if (!s_anim_buf_fs || !s_anim_buf_anim || !s_anim_buf_main) {
         if (s_anim_buf_fs)   { heap_caps_free(s_anim_buf_fs);   s_anim_buf_fs = NULL; }
         if (s_anim_buf_anim) { heap_caps_free(s_anim_buf_anim); s_anim_buf_anim = NULL; }
@@ -532,7 +532,7 @@ void panel_anim_close(const panel_anim_cfg_t *cfg)
     lv_obj_add_flag(*cfg->overlay_ref, LV_OBJ_FLAG_HIDDEN);
     if (lv_snapshot_take_to_buf(lv_scr_act(), LV_IMG_CF_TRUE_COLOR,
                                 &s_anim_dsc_main, s_anim_buf_main,
-                                172 * 320 * 2) != LV_RES_OK) {
+                                TFT_HOR_RES * TFT_VER_RES * 2) != LV_RES_OK) {
         lv_obj_clear_flag(*cfg->overlay_ref, LV_OBJ_FLAG_HIDDEN);
         cfg->close_real();
         heap_caps_free(s_anim_buf_fs);   s_anim_buf_fs   = NULL;

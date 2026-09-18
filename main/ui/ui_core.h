@@ -6,15 +6,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "lvgl.h"
+#include "board_config.h"
 #include "bt_a2dp.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* 屏幕尺寸 */
-#define TFT_HOR_RES   172   /* 水平分辨率 */
-#define TFT_VER_RES   320   /* 垂直分辨率 */
+/* 屏幕尺寸 (ES3C28P: ILI9341 240x320 原生, 横屏输出 320x240) */
+#define TFT_HOR_RES   BOARD_LCD_H_RES
+#define TFT_VER_RES   BOARD_LCD_V_RES
 
 /* 配色 (播放器主界面 / 各 UI 组件共用) */
 #define COLOR_BG      lv_color_hex(0x050505)   /* 背景 (近黑) */

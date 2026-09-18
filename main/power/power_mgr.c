@@ -16,20 +16,20 @@
 #include "bt_a2dp.h"
 #include "ui_core.h"
 #include "sys_monitor.h"
-#include "battery_low_img.h"
 #include "atomic_utils.h"
+#include "board_config.h"
 #include "power_mgr.h"
 
 static const char *TAG = "POWER";
 
-/* GPIO37: 息屏/唤醒按键 (外部 10k 下拉, 仅输入, 只测上升沿) */
-#define PIN_PWR_KEY      GPIO_NUM_37
-/* GPIO22: 外设供电控制 (高=切断外设供电), 深睡时保持 */
-#define PIN_PWR_CUT      GPIO_NUM_22
+/* BOOT 键 (GPIO0): 息屏/唤醒按键 (板载已有下拉, 按下为低电平) */
+#define PIN_PWR_KEY      BOARD_KEY_PWR
+/* 功放使能 (GPIO1): 高=禁用功放, 低=使能; 深睡时保持 */
+#define PIN_PWR_CUT      BOARD_PA_EN_GPIO
 
 /* ── 电池电压 ADC (开机检测 + sys_monitor 周期采样共用) ── */
-#define VBAT_ADC_UNIT   ADC_UNIT_1    /* 电池电压使用的 ADC 单元 */
-#define VBAT_ADC_CHAN   ADC_CHANNEL_7 /* 电池电压 ADC 通道 */
+#define VBAT_ADC_UNIT   BOARD_VBAT_ADC_UNIT    /* 电池电压使用的 ADC 单元 */
+#define VBAT_ADC_CHAN   BOARD_VBAT_ADC_CHAN    /* ADC1 CH8 = GPIO9 */
 #define VBAT_DIVIDER_RATIO 2.0f       /* 分压比: 电阻分压 2:1, 电压乘 2 还原 */
 
 #define VBAT_BOOT_SAMPLES  3          /* 开机检测采样次数 (取平均滤波) */
@@ -138,7 +138,7 @@ static void enter_deep_sleep_now(void)
     gpio_hold_en(PIN_PWR_CUT);             /* 锁定引脚电平, 深睡期间不掉 */
     gpio_deep_sleep_hold_en();             /* 允许深睡期间保持引脚 */
 
-    esp_sleep_enable_ext0_wakeup(PIN_PWR_KEY, 1);   /* GPIO37 高电平唤醒 */
+    esp_sleep_enable_ext0_wakeup(PIN_PWR_KEY, 0);   /* BOOT 键按下(低电平)唤醒 */
     esp_deep_sleep_start();                          /* 进入深睡 (此处不返回) */
 }
 
@@ -340,22 +340,25 @@ void power_mgr_boot_battery_check(void)
     /* 整屏写入低电量图: 申请 172x32 行带缓冲, 分 10 块刷完一屏.
      * 用 lcd_draw_bitmap_sync (含 DMA 屏障) 每块等传输完成后再进下一块,
      * 避免 esp_lcd 异步 DMA 仍在读缓冲就被改写/释放而导致的错位/抽搐. */
-    const size_t band_bytes = (size_t)BATTERY_LOW_IMG_W * VBAT_BAND_ROWS * 2;
+    /* 整屏暗红提示: 原低电量图为 172x320, 与本机 320x240 不符, 改用纯色分块刷屏 */
+    const size_t band_bytes = (size_t)TFT_HOR_RES * VBAT_BAND_ROWS * 2;
     uint8_t *buf = heap_caps_malloc(band_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
 
     if (buf) {
-        for (int y = 0; y < BATTERY_LOW_IMG_H; y += VBAT_BAND_ROWS) {
+        for (size_t i = 0; i < band_bytes; i += 2) {
+            buf[i]     = 0x00;   /* RGB565 暗红 0x8000, 大端排列 */
+            buf[i + 1] = 0x80;
+        }
+        for (int y = 0; y < TFT_VER_RES; y += VBAT_BAND_ROWS) {
             int rows = VBAT_BAND_ROWS;
-            if (y + rows > BATTERY_LOW_IMG_H) rows = BATTERY_LOW_IMG_H - y;
-            size_t copy = (size_t)BATTERY_LOW_IMG_W * rows * 2;
-            memcpy(buf, battery_low_img + (size_t)y * BATTERY_LOW_IMG_W * 2, copy);
-            if (lcd_draw_bitmap_sync(0, y, BATTERY_LOW_IMG_W, y + rows, buf) != ESP_OK) {
-                ESP_LOGE(TAG, "低电量图写屏失败 (y=%d)", y);
+            if (y + rows > TFT_VER_RES) rows = TFT_VER_RES - y;
+            if (lcd_draw_bitmap_sync(0, y, TFT_HOR_RES, y + rows, buf) != ESP_OK) {
+                ESP_LOGE(TAG, "低电量提示写屏失败 (y=%d)", y);
             }
         }
         heap_caps_free(buf);
     } else {
-        ESP_LOGE(TAG, "低电量图缓冲分配失败");
+        ESP_LOGE(TAG, "低电量提示缓冲分配失败");
     }
     vTaskDelay(pdMS_TO_TICKS(50));
     lcd_set_brightness(VBAT_LOW_BRI);   /* 刷屏完成后拉高背光 */
