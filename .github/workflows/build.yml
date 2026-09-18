@@ -19,11 +19,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build
+      - name: Show BT config
         shell: bash
         run: |
           . $IDF_PATH/export.sh
           idf.py set-target esp32s3
+          grep -E "^CONFIG_BT_" sdkconfig | grep -E "ENABLED|A2DP|AVRCP|CLASSIC|MODE" || true
+
+      - name: Build
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
           idf.py build
 
       - name: Upload merged binary
