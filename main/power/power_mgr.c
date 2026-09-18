@@ -277,12 +277,22 @@ static void vbat_adc_init(void)
     };
     adc_oneshot_config_channel(s_adc_handle, VBAT_ADC_CHAN, &chan_cfg);
 
+    /* ESP32 用 line fitting, ESP32-S3 用 curve fitting (两套 API 不共存) */
+#if CONFIG_IDF_TARGET_ESP32
     adc_cali_line_fitting_config_t cali_cfg = {
         .unit_id  = VBAT_ADC_UNIT,
         .atten    = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
     if (adc_cali_create_scheme_line_fitting(&cali_cfg, &s_cali_handle) != ESP_OK) {
+#else
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = VBAT_ADC_UNIT,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_cali_handle) != ESP_OK) {
+#endif
         ESP_LOGW(TAG, "eFuse 两点校准不可用, 退回线性估算");
         s_cali_handle = NULL;
     }
